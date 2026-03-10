@@ -1,0 +1,341 @@
+-- | MakerDAO-esque CDP vault system.
+-- Users deposit collateral to mint stablecoins. Overcollateralization enforced.
+-- Undercollateralized vaults can be liquidated by any party (with admin co-sign).
+-- Stability fees accrue linearly on each vault operation.
+module Stablecoin.Vault where
+
+import DA.Action (when)
+import DA.Time (subTime, convertRelTimeToMicroseconds)
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1
+
+import SimpleToken.Holding (SimpleHolding(..))
+import Stablecoin.Oracle (PriceOracle)
+
+-- | Configuration parameters for CDP vaults.
+data VaultParams = VaultParams
+  with
+    minCollateralRatio : Decimal
+    liquidationRatio : Decimal
+    liquidationBonus : Decimal
+    stabilityFeeRate : Decimal
+  deriving (Show, Eq)
+
+-- | Result of a vault liquidation.
+data VaultLiquidationResult = VaultLiquidationResult
+  with
+    liquidatorCollateralCid : ContractId SimpleHolding
+    liquidatorChangeCid : Optional (ContractId SimpleHolding)
+    ownerCollateralCid : Optional (ContractId SimpleHolding)
+    badDebt : Decimal
+  deriving (Show, Eq)
+
+-- | Factory for creating CDP vaults. Nonconsuming (reusable).
+template VaultFactory
+  with
+    admin : Party
+    collateralInstrumentId : InstrumentId
+    stablecoinInstrumentId : InstrumentId
+    params : VaultParams
+  where
+    signatory admin
+    ensure params.minCollateralRatio > 1.0
+        && params.liquidationRatio > 1.0
+        && params.liquidationRatio <= params.minCollateralRatio
+        && params.liquidationBonus >= 0.0
+        && params.stabilityFeeRate >= 0.0
+        && collateralInstrumentId.admin == admin
+        && stablecoinInstrumentId.admin == admin
+
+    -- | Open a new vault by depositing collateral.
+    nonconsuming choice VaultFactory_OpenVault : ContractId Vault
+      with
+        owner : Party
+        collateralHoldingCids : [ContractId Holding]
+      controller admin, owner
+      do
+        assertMsg "collateralHoldingCids must not be empty"
+          (not $ null collateralHoldingCids)
+        totalCollateral <- archiveAndSumCollateral admin owner collateralInstrumentId collateralHoldingCids
+        assertMsg "Total collateral must be positive" (totalCollateral > 0.0)
+        now <- getTime
+        create Vault with
+          admin
+          owner
+          collateralInstrumentId
+          stablecoinInstrumentId
+          collateralAmount = totalCollateral
+          debtAmount = 0.0
+          params
+          lastAccrualTime = now
+
+-- | A Collateralized Debt Position (CDP).
+-- Immutable contract; all mutations consume and recreate.
+template Vault
+  with
+    admin : Party
+    owner : Party
+    collateralInstrumentId : InstrumentId
+    stablecoinInstrumentId : InstrumentId
+    collateralAmount : Decimal
+    debtAmount : Decimal
+    params : VaultParams
+    lastAccrualTime : Time
+  where
+    signatory admin, owner
+    ensure collateralAmount > 0.0
+        && debtAmount >= 0.0
+
+    -- | Deposit additional collateral into the vault.
+    choice Vault_DepositCollateral : ContractId Vault
+      with
+        collateralHoldingCids : [ContractId Holding]
+      controller owner
+      do
+        assertMsg "collateralHoldingCids must not be empty"
+          (not $ null collateralHoldingCids)
+        additionalCollateral <- archiveAndSumCollateral admin owner collateralInstrumentId collateralHoldingCids
+        now <- getTime
+        let accruedDebt = accrueDebt debtAmount lastAccrualTime now params.stabilityFeeRate
+        create this with
+          collateralAmount = collateralAmount + additionalCollateral
+          debtAmount = accruedDebt
+          lastAccrualTime = now
+
+    -- | Withdraw collateral from the vault. Must maintain minCollateralRatio.
+    choice Vault_WithdrawCollateral : (ContractId Vault, ContractId SimpleHolding)
+      with
+        withdrawAmount : Decimal
+        oracleCid : ContractId PriceOracle
+      controller owner
+      do
+        assertMsg "Withdraw amount must be positive" (withdrawAmount > 0.0)
+        assertMsg "Withdraw amount exceeds collateral"
+          (withdrawAmount <= collateralAmount)
+        now <- getTime
+        let accruedDebt = accrueDebt debtAmount lastAccrualTime now params.stabilityFeeRate
+        let newCollateral = collateralAmount - withdrawAmount
+        oracle <- fetch oracleCid
+        assertMsg "Oracle admin mismatch" (oracle.admin == admin)
+        assertMsg "Oracle collateralInstrumentId mismatch"
+          (oracle.collateralInstrumentId == collateralInstrumentId)
+        when (accruedDebt > 0.0) $
+          assertMsg "Withdrawal would breach minCollateralRatio"
+            (collateralRatio newCollateral accruedDebt oracle.price >= params.minCollateralRatio)
+        vaultCid <- create this with
+          collateralAmount = newCollateral
+          debtAmount = accruedDebt
+          lastAccrualTime = now
+        holdingCid <- create SimpleHolding with
+          admin
+          owner
+          instrumentId = collateralInstrumentId
+          amount = withdrawAmount
+          meta = emptyMetadata
+        pure (vaultCid, holdingCid)
+
+    -- | Mint stablecoin against collateral. Must maintain minCollateralRatio.
+    choice Vault_MintStablecoin : (ContractId Vault, ContractId SimpleHolding)
+      with
+        mintAmount : Decimal
+        oracleCid : ContractId PriceOracle
+      controller owner
+      do
+        assertMsg "Mint amount must be positive" (mintAmount > 0.0)
+        now <- getTime
+        let accruedDebt = accrueDebt debtAmount lastAccrualTime now params.stabilityFeeRate
+        let newDebt = accruedDebt + mintAmount
+        oracle <- fetch oracleCid
+        assertMsg "Oracle admin mismatch" (oracle.admin == admin)
+        assertMsg "Oracle collateralInstrumentId mismatch"
+          (oracle.collateralInstrumentId == collateralInstrumentId)
+        assertMsg "Minting would breach minCollateralRatio"
+          (collateralRatio collateralAmount newDebt oracle.price >= params.minCollateralRatio)
+        vaultCid <- create this with
+          debtAmount = newDebt
+          lastAccrualTime = now
+        stablecoinCid <- create SimpleHolding with
+          admin
+          owner
+          instrumentId = stablecoinInstrumentId
+          amount = mintAmount
+          meta = emptyMetadata
+        pure (vaultCid, stablecoinCid)
+
+    -- | Burn stablecoin to reduce debt.
+    choice Vault_BurnStablecoin : ContractId Vault
+      with
+        stablecoinHoldingCids : [ContractId Holding]
+      controller owner
+      do
+        assertMsg "stablecoinHoldingCids must not be empty"
+          (not $ null stablecoinHoldingCids)
+        burnAmount <- archiveAndSumCollateral admin owner stablecoinInstrumentId stablecoinHoldingCids
+        now <- getTime
+        let accruedDebt = accrueDebt debtAmount lastAccrualTime now params.stabilityFeeRate
+        assertMsg "Burn amount exceeds debt" (burnAmount <= accruedDebt)
+        create this with
+          debtAmount = accruedDebt - burnAmount
+          lastAccrualTime = now
+
+    -- | Close the vault entirely. Owner must repay all debt.
+    -- Returns all collateral to owner.
+    choice Vault_Close : ContractId SimpleHolding
+      with
+        stablecoinHoldingCids : [ContractId Holding]
+      controller owner
+      do
+        now <- getTime
+        let accruedDebt = accrueDebt debtAmount lastAccrualTime now params.stabilityFeeRate
+        when (accruedDebt > 0.0) $ do
+          assertMsg "stablecoinHoldingCids must not be empty when debt > 0"
+            (not $ null stablecoinHoldingCids)
+          burnTotal <- archiveAndSumCollateral admin owner stablecoinInstrumentId stablecoinHoldingCids
+          assertMsg "Must repay full debt to close vault"
+            (burnTotal >= accruedDebt)
+          when (burnTotal > accruedDebt) $ do
+            _ <- create SimpleHolding with
+              admin
+              owner
+              instrumentId = stablecoinInstrumentId
+              amount = burnTotal - accruedDebt
+              meta = emptyMetadata
+            pure ()
+        create SimpleHolding with
+          admin
+          owner
+          instrumentId = collateralInstrumentId
+          amount = collateralAmount
+          meta = emptyMetadata
+
+    -- | Liquidate an undercollateralized vault.
+    -- Liquidator provides stablecoin to cover debt, receives collateral at discount.
+    choice Vault_Liquidate : VaultLiquidationResult
+      with
+        liquidator : Party
+        stablecoinHoldingCids : [ContractId Holding]
+        oracleCid : ContractId PriceOracle
+      controller admin, liquidator
+      do
+        now <- getTime
+        let accruedDebt = accrueDebt debtAmount lastAccrualTime now params.stabilityFeeRate
+        oracle <- fetch oracleCid
+        assertMsg "Oracle admin mismatch" (oracle.admin == admin)
+        assertMsg "Oracle collateralInstrumentId mismatch"
+          (oracle.collateralInstrumentId == collateralInstrumentId)
+        assertMsg "Oracle price must be positive" (oracle.price > 0.0)
+        assertMsg "Vault is not undercollateralized"
+          (accruedDebt > 0.0
+           && collateralRatio collateralAmount accruedDebt oracle.price < params.liquidationRatio)
+        assertMsg "stablecoinHoldingCids must not be empty"
+          (not $ null stablecoinHoldingCids)
+        liquidatorPayment <- archiveAndSumCollateral admin liquidator stablecoinInstrumentId stablecoinHoldingCids
+        let collateralToSeize = (accruedDebt * (1.0 + params.liquidationBonus)) / oracle.price
+        if collateralToSeize >= collateralAmount then do
+          let actualDebtCovered = min liquidatorPayment accruedDebt
+          liquidatorCollateralCid <- create SimpleHolding with
+            admin
+            owner = liquidator
+            instrumentId = collateralInstrumentId
+            amount = collateralAmount
+            meta = emptyMetadata
+          liquidatorChangeCid <- if liquidatorPayment > actualDebtCovered
+            then do
+              cid <- create SimpleHolding with
+                admin
+                owner = liquidator
+                instrumentId = stablecoinInstrumentId
+                amount = liquidatorPayment - actualDebtCovered
+                meta = emptyMetadata
+              pure (Some cid)
+            else pure None
+          pure VaultLiquidationResult with
+            liquidatorCollateralCid
+            liquidatorChangeCid
+            ownerCollateralCid = None
+            badDebt = accruedDebt - actualDebtCovered
+        else do
+          assertMsg "Liquidator must provide enough stablecoin to cover debt"
+            (liquidatorPayment >= accruedDebt)
+          liquidatorCollateralCid <- create SimpleHolding with
+            admin
+            owner = liquidator
+            instrumentId = collateralInstrumentId
+            amount = collateralToSeize
+            meta = emptyMetadata
+          liquidatorChangeCid <- if liquidatorPayment > accruedDebt
+            then do
+              cid <- create SimpleHolding with
+                admin
+                owner = liquidator
+                instrumentId = stablecoinInstrumentId
+                amount = liquidatorPayment - accruedDebt
+                meta = emptyMetadata
+              pure (Some cid)
+            else pure None
+          let remainingCollateral = collateralAmount - collateralToSeize
+          ownerCollateralCid <- if remainingCollateral > 0.0
+            then do
+              cid <- create SimpleHolding with
+                admin
+                owner
+                instrumentId = collateralInstrumentId
+                amount = remainingCollateral
+                meta = emptyMetadata
+              pure (Some cid)
+            else pure None
+          pure VaultLiquidationResult with
+            liquidatorCollateralCid
+            liquidatorChangeCid
+            ownerCollateralCid
+            badDebt = 0.0
+
+
+-- Helper functions
+--------------------
+
+-- | Archive input holdings and sum their amounts.
+-- Validates: owner match, instrumentId match, no unexpired locks.
+archiveAndSumCollateral : Party -> Party -> InstrumentId -> [ContractId Holding] -> Update Decimal
+archiveAndSumCollateral expectedAdmin expectedOwner expectedInstrumentId holdingCids = do
+  amounts <- forA holdingCids $ \holdingCid -> do
+    holdingI <- fetch holdingCid
+    let hv = view holdingI
+    assertMsg "Input holding owner does not match expected owner"
+      (hv.owner == expectedOwner)
+    assertMsg "Input holding instrumentId does not match expected"
+      (hv.instrumentId == expectedInstrumentId)
+    assertMsg "Input holding admin does not match expected"
+      (hv.instrumentId.admin == expectedAdmin)
+    case hv.lock of
+      None -> pure ()
+      Some lock -> do
+        now <- getTime
+        let lockExpired = case lock.expiresAt of
+              None -> False
+              Some t -> now >= t
+        assertMsg "Cannot use holding with unexpired lock"
+          lockExpired
+    archive holdingCid
+    pure hv.amount
+  pure (sum amounts)
+
+-- | Calculate accrued debt with linear stability fee.
+-- newDebt = oldDebt * (1 + rate * elapsedYears)
+accrueDebt : Decimal -> Time -> Time -> Decimal -> Decimal
+accrueDebt currentDebt lastAccrual now annualRate =
+  if currentDebt == 0.0 || annualRate == 0.0 then currentDebt
+  else
+    let elapsed = subTime now lastAccrual
+        elapsedMicros = convertRelTimeToMicroseconds elapsed
+        microsPerYear = 365 * 24 * 3600 * 1_000_000
+        elapsedYears = intToDecimal elapsedMicros / intToDecimal microsPerYear
+    in currentDebt * (1.0 + annualRate * elapsedYears)
+
+-- | Calculate collateral ratio.
+-- ratio = (collateralAmount * price) / debt
+collateralRatio : Decimal -> Decimal -> Decimal -> Decimal
+collateralRatio collateral debt price =
+  if debt == 0.0 then 999999.0
+  else (collateral * price) / debt

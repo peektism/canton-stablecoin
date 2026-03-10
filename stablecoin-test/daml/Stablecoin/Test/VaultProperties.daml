@@ -1,0 +1,73 @@
+-- | Property-based tests for the vault state-machine model.
+-- Each test_ function is discovered by dpm test.
+module Stablecoin.Test.VaultProperties where
+
+import Daml.Script
+import DamlProps.Runner
+import Stablecoin.Test.VaultModel
+
+-- | Runner config for vault properties.
+vaultConfig : Text -> RunnerConfig
+vaultConfig name = (defaultRunnerConfig name) with
+  numTests = 200
+  maxSequenceLength = 15
+
+-- | Property 1: Collateral never goes negative.
+test_vaultCollateralNonNegative : Script ()
+test_vaultCollateralNonNegative = script do
+  let checkCollateral st =
+        if st.collateral < 0.0
+        then Left ("Negative collateral: " <> show st.collateral)
+        else Right ()
+  let result = runProp (vaultConfig "collateral-non-negative") genVaultAction
+                executeVaultAction checkCollateral mkInitialState
+  assertResult "collateral-non-negative" result
+
+-- | Property 2: Debt never goes negative.
+test_vaultDebtNonNegative : Script ()
+test_vaultDebtNonNegative = script do
+  let checkDebt st =
+        if st.debt < 0.0
+        then Left ("Negative debt: " <> show st.debt)
+        else Right ()
+  let result = runProp (vaultConfig "debt-non-negative") genVaultAction
+                executeVaultAction checkDebt mkInitialState
+  assertResult "debt-non-negative" result
+
+-- | Property 3: Oracle price always stays positive.
+test_vaultPricePositive : Script ()
+test_vaultPricePositive = script do
+  let checkPrice st =
+        if st.price <= 0.0
+        then Left ("Non-positive price: " <> show st.price)
+        else Right ()
+  let result = runProp (vaultConfig "price-positive") genVaultAction
+                executeVaultAction checkPrice mkInitialState
+  assertResult "price-positive" result
+
+-- | Property 4: All invariants hold under full lifecycle with liquidation.
+test_vaultFullLifecycle : Script ()
+test_vaultFullLifecycle = script do
+  let config = (vaultConfig "full-lifecycle") with maxSequenceLength = 20
+  let result = runProp config genVaultAction
+                executeVaultAction checkVaultInvariants mkInitialState
+  assertResult "full-lifecycle" result
+
+-- | Property 5: Vault with debt can never have collateral == 0
+-- (because ensure clause requires collateral > 0 and debt >= 0,
+-- and liquidation sets debt to 0 when collateral goes to 0).
+test_vaultDebtImpliesCollateral : Script ()
+test_vaultDebtImpliesCollateral = script do
+  let checkImplication st =
+        if st.debt > 0.0 && st.collateral <= 0.0
+        then Left ("Debt > 0 but collateral <= 0: debt=" <> show st.debt
+                   <> " collateral=" <> show st.collateral)
+        else Right ()
+  let result = runProp (vaultConfig "debt-implies-collateral") genVaultAction
+                executeVaultAction checkImplication mkInitialState
+  assertResult "debt-implies-collateral" result
+
+-- | Helper: assert a RunResult is AllPassed, error otherwise.
+assertResult : Text -> RunResult VaultState VaultAction -> Script ()
+assertResult name (AllPassed _ _) = debug (name <> ": PASSED")
+assertResult name (FoundFailure d) = error (formatDetail d)

@@ -1,0 +1,33 @@
+-- | Admin-controlled price oracle for collateral valuation.
+-- Price is denominated in stablecoin units per one unit of collateral.
+-- E.g., price = 2000.0 means 1 collateral = 2000 stablecoin.
+module Stablecoin.Oracle where
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+-- | A price feed for a single collateral asset.
+-- Observers should include all parties that need to read the price
+-- (e.g., vault owners who exercise choices that fetch the oracle).
+template PriceOracle
+  with
+    admin : Party
+    collateralInstrumentId : InstrumentId
+    price : Decimal
+    updatedAt : Time
+    observers : [Party]
+  where
+    signatory admin
+    observer observers
+    ensure price > 0.0
+
+    -- | Update the price. Consuming: archives old oracle, creates new one.
+    choice PriceOracle_UpdatePrice : ContractId PriceOracle
+      with
+        newPrice : Decimal
+      controller admin
+      do
+        assertMsg "New price must be positive" (newPrice > 0.0)
+        now <- getTime
+        create this with
+          price = newPrice
+          updatedAt = now

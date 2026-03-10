@@ -1,0 +1,454 @@
+-- | CDP vault system tests: happy path + negative/security tests.
+module Stablecoin.Test.Cdp where
+
+import DA.Date
+import DA.Optional (fromSome, isNone, isSome)
+import DA.Time
+
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.TransferInstructionV1
+
+import SimpleToken.Holding (SimpleHolding(..))
+import SimpleToken.Rules (SimpleTokenRules(..))
+
+import Stablecoin.Oracle
+import Stablecoin.Vault
+
+-- Test environment
+--------------------
+
+data CdpTestEnv = CdpTestEnv with
+    admin : Party
+    alice : Party
+    bob : Party
+    charlie : Party
+    collateralInstrumentId : InstrumentId
+    stablecoinInstrumentId : InstrumentId
+    factoryCid : ContractId VaultFactory
+    oracleCid : ContractId PriceOracle
+
+demoTime : Time
+demoTime = time (date 2024 Jan 1) 0 0 0
+
+defaultParams : VaultParams
+defaultParams = VaultParams with
+    minCollateralRatio = 1.5
+    liquidationRatio = 1.3
+    liquidationBonus = 0.13
+    stabilityFeeRate = 0.02
+
+setupCdpTestEnv : Script CdpTestEnv
+setupCdpTestEnv = do
+  setTime demoTime
+  admin <- allocatePartyByHint (PartyIdHint "admin")
+  alice <- allocatePartyByHint (PartyIdHint "alice")
+  bob <- allocatePartyByHint (PartyIdHint "bob")
+  charlie <- allocatePartyByHint (PartyIdHint "charlie")
+  let collateralInstrumentId = InstrumentId with admin; id = "Collateral"
+  let stablecoinInstrumentId = InstrumentId with admin; id = "Stablecoin"
+  factoryCid <- submit admin $ createCmd VaultFactory with
+    admin
+    collateralInstrumentId
+    stablecoinInstrumentId
+    params = defaultParams
+  oracleCid <- submit admin $ createCmd PriceOracle with
+    admin
+    collateralInstrumentId
+    price = 2000.0
+    updatedAt = demoTime
+    observers = [alice, bob, charlie]
+  pure CdpTestEnv with
+    admin; alice; bob; charlie
+    collateralInstrumentId; stablecoinInstrumentId
+    factoryCid; oracleCid
+
+-- | Create collateral holdings for a party.
+fundCollateral : CdpTestEnv -> Party -> Decimal -> Script (ContractId Holding)
+fundCollateral env owner amount = do
+  cid <- submitMulti [env.admin, owner] [] $ createCmd SimpleHolding with
+    admin = env.admin
+    owner
+    instrumentId = env.collateralInstrumentId
+    amount
+    meta = emptyMetadata
+  pure (toInterfaceContractId @Holding cid)
+
+-- | Create stablecoin holdings for a party (for burn/liquidation tests).
+fundStablecoin : CdpTestEnv -> Party -> Decimal -> Script (ContractId Holding)
+fundStablecoin env owner amount = do
+  cid <- submitMulti [env.admin, owner] [] $ createCmd SimpleHolding with
+    admin = env.admin
+    owner
+    instrumentId = env.stablecoinInstrumentId
+    amount
+    meta = emptyMetadata
+  pure (toInterfaceContractId @Holding cid)
+
+-- | Open a vault with given collateral amount.
+openVault : CdpTestEnv -> Party -> Decimal -> Script (ContractId Vault)
+openVault env owner collateralAmount = do
+  collateralCid <- fundCollateral env owner collateralAmount
+  submitMulti [env.admin, owner] [] $ exerciseCmd env.factoryCid VaultFactory_OpenVault with
+    owner
+    collateralHoldingCids = [collateralCid]
+
+-- | Fetch a vault by CID, failing if not found.
+fetchVault : Party -> ContractId Vault -> Script Vault
+fetchVault p cid = fromSome <$> queryContractId p cid
+
+-- | Fetch a SimpleHolding by CID, failing if not found.
+fetchHolding : Party -> ContractId SimpleHolding -> Script SimpleHolding
+fetchHolding p cid = fromSome <$> queryContractId p cid
+
+-- | Fetch a PriceOracle by CID, failing if not found.
+fetchOracle : Party -> ContractId PriceOracle -> Script PriceOracle
+fetchOracle p cid = fromSome <$> queryContractId p cid
+
+
+-- =====================
+-- HAPPY PATH TESTS
+-- =====================
+
+-- C1: Open a vault
+test_openVault : Script ()
+test_openVault = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  vault <- fetchVault env.alice vaultCid
+  assertMsg "collateralAmount should be 10.0" (vault.collateralAmount == (10.0 : Decimal))
+  assertMsg "debtAmount should be 0.0" (vault.debtAmount == (0.0 : Decimal))
+  assertMsg "owner should be alice" (vault.owner == env.alice)
+
+-- C2: Mint stablecoin
+test_mintStablecoin : Script ()
+test_mintStablecoin = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  -- 10 collateral * 2000 price = 20000 value. At 150% ratio, max debt = 20000/1.5 = 13333
+  (newVaultCid, stablecoinCid) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 10000.0
+    oracleCid = env.oracleCid
+  vault <- fetchVault env.alice newVaultCid
+  assertMsg "debtAmount should be 10000" (vault.debtAmount == (10000.0 : Decimal))
+  stablecoin <- fetchHolding env.alice stablecoinCid
+  assertMsg "stablecoin amount should be 10000" (stablecoin.amount == (10000.0 : Decimal))
+  assertMsg "stablecoin instrument should be stablecoin"
+    (stablecoin.instrumentId == env.stablecoinInstrumentId)
+
+-- C3: Burn stablecoin
+test_burnStablecoin : Script ()
+test_burnStablecoin = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 10000.0
+    oracleCid = env.oracleCid
+  burnCid <- fundStablecoin env env.alice 5000.0
+  vaultCid3 <- submit env.alice $ exerciseCmd vaultCid2 Vault_BurnStablecoin with
+    stablecoinHoldingCids = [burnCid]
+  vault <- fetchVault env.alice vaultCid3
+  assertMsg "debtAmount should be 5000" (vault.debtAmount == (5000.0 : Decimal))
+
+-- C4: Deposit additional collateral
+test_depositCollateral : Script ()
+test_depositCollateral = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  extraCollateral <- fundCollateral env env.alice 5.0
+  vaultCid2 <- submit env.alice $ exerciseCmd vaultCid Vault_DepositCollateral with
+    collateralHoldingCids = [extraCollateral]
+  vault <- fetchVault env.alice vaultCid2
+  assertMsg "collateralAmount should be 15.0" (vault.collateralAmount == (15.0 : Decimal))
+
+-- C5: Withdraw collateral (ratio stays safe)
+test_withdrawCollateral : Script ()
+test_withdrawCollateral = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+  -- ratio: (10 * 2000) / 5000 = 4.0. Withdraw 2 -> (8 * 2000) / 5000 = 3.2 > 1.5
+  (vaultCid3, collateralHolding) <- submit env.alice $ exerciseCmd vaultCid2 Vault_WithdrawCollateral with
+    withdrawAmount = 2.0
+    oracleCid = env.oracleCid
+  vault <- fetchVault env.alice vaultCid3
+  assertMsg "collateralAmount should be 8.0" (vault.collateralAmount == (8.0 : Decimal))
+  holding <- fetchHolding env.alice collateralHolding
+  assertMsg "withdrawn collateral should be 2.0" (holding.amount == (2.0 : Decimal))
+
+-- C6: Close vault with zero debt
+test_closeVaultZeroDebt : Script ()
+test_closeVaultZeroDebt = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  collateralCid <- submit env.alice $ exerciseCmd vaultCid Vault_Close with
+    stablecoinHoldingCids = []
+  holding <- fetchHolding env.alice collateralCid
+  assertMsg "returned collateral should be 10.0" (holding.amount == (10.0 : Decimal))
+  assertMsg "returned instrument should be collateral"
+    (holding.instrumentId == env.collateralInstrumentId)
+
+-- C7: Close vault with debt (repay first)
+test_closeVaultWithDebt : Script ()
+test_closeVaultWithDebt = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+  -- Repay 5000 to close (no time passed, no fee accrual)
+  repayCid <- fundStablecoin env env.alice 5000.0
+  collateralCid <- submit env.alice $ exerciseCmd vaultCid2 Vault_Close with
+    stablecoinHoldingCids = [repayCid]
+  holding <- fetchHolding env.alice collateralCid
+  assertMsg "returned collateral should be 10.0" (holding.amount == (10.0 : Decimal))
+
+-- C8: Liquidation (standard case)
+test_liquidation : Script ()
+test_liquidation = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  -- Mint 12000. ratio = (10 * 2000) / 12000 = 1.667
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 12000.0
+    oracleCid = env.oracleCid
+  -- Drop price to 1500. ratio = (10 * 1500) / 12000 = 1.25 < 1.3. Liquidatable.
+  newOracleCid <- submit env.admin $ exerciseCmd env.oracleCid PriceOracle_UpdatePrice with
+    newPrice = 1500.0
+  bobStablecoin <- fundStablecoin env env.bob 12000.0
+  result <- submitMulti [env.admin, env.bob] [] $ exerciseCmd vaultCid2 Vault_Liquidate with
+    liquidator = env.bob
+    stablecoinHoldingCids = [bobStablecoin]
+    oracleCid = newOracleCid
+  -- collateralToSeize = 12000 * 1.13 / 1500 = 9.04
+  liquidatorHolding <- fetchHolding env.bob result.liquidatorCollateralCid
+  assertMsg "liquidator should receive collateral" (liquidatorHolding.amount > (0.0 : Decimal))
+  assertMsg "liquidator holding is collateral instrument"
+    (liquidatorHolding.instrumentId == env.collateralInstrumentId)
+  assertMsg "owner should get remaining collateral" (isSome result.ownerCollateralCid)
+  assertMsg "no bad debt" (result.badDebt == (0.0 : Decimal))
+
+-- C9: Liquidation with bad debt
+test_liquidationBadDebt : Script ()
+test_liquidationBadDebt = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 12000.0
+    oracleCid = env.oracleCid
+  -- Catastrophic drop to 500. collateralToSeize = 12000 * 1.13 / 500 = 27.12 > 10
+  newOracleCid <- submit env.admin $ exerciseCmd env.oracleCid PriceOracle_UpdatePrice with
+    newPrice = 500.0
+  -- Bob provides only 8000 (less than full 12000 debt)
+  bobStablecoin <- fundStablecoin env env.bob 8000.0
+  result <- submitMulti [env.admin, env.bob] [] $ exerciseCmd vaultCid2 Vault_Liquidate with
+    liquidator = env.bob
+    stablecoinHoldingCids = [bobStablecoin]
+    oracleCid = newOracleCid
+  liquidatorHolding <- fetchHolding env.bob result.liquidatorCollateralCid
+  assertMsg "liquidator gets all collateral" (liquidatorHolding.amount == (10.0 : Decimal))
+  assertMsg "no remaining collateral for owner" (isNone result.ownerCollateralCid)
+  assertMsg "bad debt should be 4000" (result.badDebt == (4000.0 : Decimal))
+
+-- C10: Stability fee accrual
+test_stabilityFeeAccrual : Script ()
+test_stabilityFeeAccrual = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 10000.0
+    oracleCid = env.oracleCid
+  -- Advance time by 1 year
+  passTime (days 365)
+  -- Deposit tiny amount to trigger accrual
+  extraColl <- fundCollateral env env.alice 0.1
+  vaultCid3 <- submit env.alice $ exerciseCmd vaultCid2 Vault_DepositCollateral with
+    collateralHoldingCids = [extraColl]
+  vault <- fetchVault env.alice vaultCid3
+  -- Debt should be ~10200 (10000 * 1.02)
+  let expectedDebt : Decimal = 10200.0
+  let tolerance : Decimal = 1.0
+  assertMsg ("Debt should be ~" <> show expectedDebt <> " but is " <> show vault.debtAmount)
+    (vault.debtAmount >= expectedDebt - tolerance && vault.debtAmount <= expectedDebt + tolerance)
+
+-- C11: Oracle price update
+test_oracleUpdate : Script ()
+test_oracleUpdate = do
+  env <- setupCdpTestEnv
+  newOracleCid <- submit env.admin $ exerciseCmd env.oracleCid PriceOracle_UpdatePrice with
+    newPrice = 2500.0
+  oracle <- fetchOracle env.admin newOracleCid
+  assertMsg "price should be 2500" (oracle.price == (2500.0 : Decimal))
+
+-- C12: Mint stablecoin and transfer via SimpleTokenRules
+test_mintAndTransfer : Script ()
+test_mintAndTransfer = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (_, stablecoinCid) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+  -- Create a SimpleTokenRules for stablecoin transfers
+  rulesCid <- submit env.admin $ createCmd SimpleTokenRules with
+    admin = env.admin
+    supportedInstruments = ["Stablecoin"]
+  let tfCid = toInterfaceContractId @TransferFactory rulesCid
+  now <- getTime
+  let stablecoinICid = toInterfaceContractId @Holding stablecoinCid
+  -- Self-transfer using disclosures (alice needs visibility on SimpleTokenRules)
+  rulesDisc <- queryDisclosure @SimpleTokenRules env.admin rulesCid
+  case rulesDisc of
+    None -> fail "Could not disclose SimpleTokenRules"
+    Some disc -> do
+      result <- submitWithDisclosures env.alice [disc] $ exerciseCmd tfCid TransferFactory_Transfer with
+        expectedAdmin = env.admin
+        transfer = Transfer with
+          sender = env.alice
+          receiver = env.alice
+          amount = 3000.0
+          instrumentId = env.stablecoinInstrumentId
+          inputHoldingCids = [stablecoinICid]
+          requestedAt = now
+          executeBefore = addRelTime now (hours 24)
+          meta = emptyMetadata
+        extraArgs = ExtraArgs with
+          context = emptyChoiceContext
+          meta = emptyMetadata
+      case result.output of
+        TransferInstructionResult_Completed _ -> pure ()
+        _ -> fail "Expected transfer to complete"
+
+
+-- =====================
+-- NEGATIVE TESTS
+-- =====================
+
+-- C13: Mint exceeds collateral ratio
+test_mintExceedsRatio : Script ()
+test_mintExceedsRatio = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  -- Max mint at 150% = 10 * 2000 / 1.5 = 13333.33. Try 14000.
+  submitMustFail env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 14000.0
+    oracleCid = env.oracleCid
+
+-- C14: Withdraw exceeds collateral ratio
+test_withdrawExceedsRatio : Script ()
+test_withdrawExceedsRatio = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 10000.0
+    oracleCid = env.oracleCid
+  -- ratio: (10 * 2000) / 10000 = 2.0. Withdraw 7 -> (3 * 2000) / 10000 = 0.6 < 1.5
+  submitMustFail env.alice $ exerciseCmd vaultCid2 Vault_WithdrawCollateral with
+    withdrawAmount = 7.0
+    oracleCid = env.oracleCid
+
+-- C15: Burn exceeds debt
+test_burnExceedsDebt : Script ()
+test_burnExceedsDebt = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+  burnCid <- fundStablecoin env env.alice 6000.0
+  submitMustFail env.alice $ exerciseCmd vaultCid2 Vault_BurnStablecoin with
+    stablecoinHoldingCids = [burnCid]
+
+-- C16: Liquidate healthy vault
+test_liquidateHealthyVault : Script ()
+test_liquidateHealthyVault = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+  -- ratio: (10 * 2000) / 5000 = 4.0 >> 1.3, not liquidatable
+  bobStablecoin <- fundStablecoin env env.bob 5000.0
+  submitMultiMustFail [env.admin, env.bob] [] $ exerciseCmd vaultCid2 Vault_Liquidate with
+    liquidator = env.bob
+    stablecoinHoldingCids = [bobStablecoin]
+    oracleCid = env.oracleCid
+
+-- C17: Unauthorized liquidation (no admin)
+test_liquidateUnauthorized : Script ()
+test_liquidateUnauthorized = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 12000.0
+    oracleCid = env.oracleCid
+  newOracleCid <- submit env.admin $ exerciseCmd env.oracleCid PriceOracle_UpdatePrice with
+    newPrice = 1500.0
+  bobStablecoin <- fundStablecoin env env.bob 12000.0
+  submitMustFail env.bob $ exerciseCmd vaultCid2 Vault_Liquidate with
+    liquidator = env.bob
+    stablecoinHoldingCids = [bobStablecoin]
+    oracleCid = newOracleCid
+
+-- C18: Wrong oracle admin
+test_wrongOracleAdmin : Script ()
+test_wrongOracleAdmin = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  fakeAdmin <- allocatePartyByHint (PartyIdHint "fakeAdmin")
+  let fakeInstrumentId = InstrumentId with admin = fakeAdmin; id = "Collateral"
+  fakeOracleCid <- submit fakeAdmin $ createCmd PriceOracle with
+    admin = fakeAdmin
+    collateralInstrumentId = fakeInstrumentId
+    price = 2000.0
+    updatedAt = demoTime
+    observers = [env.alice]
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+  submitMustFail env.alice $ exerciseCmd vaultCid2 Vault_WithdrawCollateral with
+    withdrawAmount = 1.0
+    oracleCid = fakeOracleCid
+
+-- C19: Wrong oracle instrument
+test_wrongOracleInstrument : Script ()
+test_wrongOracleInstrument = do
+  env <- setupCdpTestEnv
+  let wrongInstrumentId = InstrumentId with admin = env.admin; id = "WrongToken"
+  wrongOracleCid <- submit env.admin $ createCmd PriceOracle with
+    admin = env.admin
+    collateralInstrumentId = wrongInstrumentId
+    price = 2000.0
+    updatedAt = demoTime
+    observers = [env.alice]
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+  submitMustFail env.alice $ exerciseCmd vaultCid2 Vault_WithdrawCollateral with
+    withdrawAmount = 1.0
+    oracleCid = wrongOracleCid
+
+-- C20: Wrong owner collateral (deposit someone else's holdings)
+test_wrongOwnerCollateral : Script ()
+test_wrongOwnerCollateral = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  bobCollateral <- fundCollateral env env.bob 5.0
+  submitMustFail env.alice $ exerciseCmd vaultCid Vault_DepositCollateral with
+    collateralHoldingCids = [bobCollateral]
+
+-- C21: Close vault with insufficient repayment
+test_closeInsufficientRepayment : Script ()
+test_closeInsufficientRepayment = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 10000.0
+    oracleCid = env.oracleCid
+  insufficientCid <- fundStablecoin env env.alice 5000.0
+  submitMustFail env.alice $ exerciseCmd vaultCid2 Vault_Close with
+    stablecoinHoldingCids = [insufficientCid]
