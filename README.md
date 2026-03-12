@@ -11,7 +11,7 @@ Three verification tools (static analysis, property testing, formal proofs) vali
 ## Quick Start
 
 ```sh
-git clone https://github.com/4meta5/canton-stablecoin.git && cd canton-stablecoin
+git clone https://github.com/OpenZeppelin/canton-stablecoin.git && cd canton-stablecoin
 scripts/setup.sh            # checks tools, builds, runs tests
 ```
 
@@ -54,15 +54,15 @@ Write tests first. The TDD skill enforces RED-GREEN-REFACTOR gates.
 scripts/verify.sh     # runs all three tools
 ```
 
-- [daml-lint](https://github.com/4meta5/daml-lint) -- static analysis (6 detectors, <1s)
-- [daml-props](https://github.com/4meta5/daml-props) -- property-based testing with shrinking (~30s)
-- [daml-verify](https://github.com/4meta5/daml-verify) -- formal verification via Z3 (~2s)
+- [daml-lint](https://github.com/OpenZeppelin/daml-lint) -- static analysis (6 detectors, <1s)
+- [daml-props](https://github.com/OpenZeppelin/daml-props) -- property-based testing with shrinking (~30s)
+- [daml-verify](https://github.com/OpenZeppelin/daml-verify) -- formal verification via Z3 (~2s)
 
 Install verification tools: `scripts/setup.sh` (without `--skip-verification`).
 
 ## Agent Skills
 
-For AI-assisted development with Claude Code or Codex, see [daml-skills](https://github.com/4meta5/daml-skills.git).
+For AI-assisted development with Claude Code or Codex, see [daml-skills](https://github.com/OpenZeppelin/daml-skills.git).
 
 ## Prerequisites
 

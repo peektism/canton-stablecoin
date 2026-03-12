@@ -10,7 +10,7 @@ Patterns extracted from five FOSS reference projects for building DAML stablecoi
 - [splice](https://github.com/hyperledger-labs/splice)
 
 **Date:** 2026-03-04
-**Audit tools:** [daml-lint](https://github.com/4meta5/daml-lint), [daml-props](https://github.com/4meta5/daml-props), [daml-verify](https://github.com/4meta5/daml-verify)
+**Audit tools:** [daml-lint](https://github.com/OpenZeppelin/daml-lint), [daml-props](https://github.com/OpenZeppelin/daml-props), [daml-verify](https://github.com/OpenZeppelin/daml-verify)
 
 ---
 

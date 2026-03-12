@@ -10,7 +10,7 @@ SDK: 3.4.10, LF target: 2.1.
 
 ## 2. Omitted Feature Analysis
 
-After running three open-source verification tools ([daml-lint](https://github.com/4meta5/daml-lint), [daml-verify](https://github.com/4meta5/daml-verify), [daml-props](https://github.com/4meta5/daml-props)) and performing manual code review, several MakerDAO features were identified as deliberately excluded. This section examines each and asks whether it is required.
+After running three open-source verification tools ([daml-lint](https://github.com/OpenZeppelin/daml-lint), [daml-verify](https://github.com/OpenZeppelin/daml-verify), [daml-props](https://github.com/OpenZeppelin/daml-props)) and performing manual code review, several MakerDAO features were identified as deliberately excluded. This section examines each and asks whether it is required.
 
 ### 2.1 Governance (MKR Voting)
 
