@@ -28,7 +28,7 @@ stablecoin-test/                      test suite
 
 **`stablecoin/daml.yaml`:**
 ```yaml
-sdk-version: 3.4.10
+sdk-version: 3.4.11
 name: stablecoin
 version: 0.1.0
 source: daml
@@ -49,7 +49,7 @@ data-dependencies:
 
 **`stablecoin-test/daml.yaml`:**
 ```yaml
-sdk-version: 3.4.10
+sdk-version: 3.4.11
 name: stablecoin-test
 version: 0.1.0
 source: daml

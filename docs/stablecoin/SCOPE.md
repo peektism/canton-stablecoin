@@ -6,7 +6,7 @@ This module delivers a minimal MakerDAO-esque Collateralized Debt Position (CDP)
 
 **Design goal:** Smallest possible addition that captures the core MakerDAO mechanics (overcollateralization, minting, liquidation, stability fees) while reusing existing templates and patterns from `simple-token`.
 
-SDK: 3.4.10, LF target: 2.1.
+SDK: 3.4.11, LF target: 2.1.
 
 ## 2. Omitted Feature Analysis
 
