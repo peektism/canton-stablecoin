@@ -16,10 +16,14 @@ stablecoin/                           production contracts
   daml/Stablecoin/
     Oracle.daml                       PriceOracle template
     Vault.daml                        VaultParams, VaultFactory, Vault + helpers
+    Experimental/Cip112/              non-release account-policy/settlement markers
 stablecoin-test/                      test suite
   daml.yaml                           depends on stablecoin + simple-token + daml-props
   daml/Stablecoin/Test/
     Cdp.daml                          all CDP tests (happy path + negative)
+    Cip112AccountPolicy.daml          experimental account-policy probes
+    Cip112LiveSettlement.daml         experimental live V2 settlement probes
+    Cip112SettlementDependency.daml   experimental V2 dependency probes
     VaultModel.daml                   pure state-machine model
     VaultProperties.daml              property-based tests
 ```
@@ -176,6 +180,18 @@ template Vault
 | `Vault_Close` | `owner` | Requires full debt repayment (with accrued fees), returns all collateral to owner |
 | `Vault_Liquidate` | `admin, liquidator` | Validates vault is undercollateralized, liquidator provides stablecoin, receives collateral at discount, remaining collateral returned to owner |
 
+**Experimental non-release CIP-0112 choices:**
+
+| Choice | Controller | What it does |
+|--------|-----------|-------------|
+| `Vault_Cip112CloseWithSettlement` | `owner` | Requires admin as settlement executor, creates and accepts V2 allocations for owner repayment and admin burn receipt, exercises live `SettlementFactory_SettleBatch`, returns collateral, and reports V2 repayment change. |
+| `Vault_Cip112LiquidateWithSettlement` | `admin, liquidator` | Requires admin as settlement executor, materializes temporary seized collateral, creates and accepts V2 allocations for debt burn and collateral seizure, exercises live batch settlement, reports liquidator change and bad debt, and returns any owner collateral remainder. |
+
+These choices are local discovery code only. They keep V1 behavior intact,
+support providerless basic accounts plus special `cip-112/mint` and
+`cip-112/burn` admin accounts, reject provider-managed settlement legs, and do
+not make CIP-0112 conformance or release-package claims.
+
 ### Authorization Analysis
 
 | Choice | Authorizers | Can create holdings for |
@@ -232,7 +248,10 @@ data VaultLiquidationResult = VaultLiquidationResult with
 
 ## Test Plan
 
-All tests in `stablecoin-test/daml/Stablecoin/Test/Cdp.daml`.
+Core V1 CDP tests live in `stablecoin-test/daml/Stablecoin/Test/Cdp.daml`.
+Experimental non-release CIP-0112 probes live in
+`Cip112AccountPolicy.daml`, `Cip112SettlementDependency.daml`, and
+`Cip112LiveSettlement.daml`.
 
 ### Setup
 
@@ -273,6 +292,17 @@ setupCdpTestEnv : Script CdpTestEnv
 | 19 | `test_wrongOracleInstrument` | Oracle for wrong collateral rejected |
 | 20 | `test_wrongOwnerCollateral` | Can't deposit someone else's collateral |
 | 21 | `test_closeInsufficientRepayment` | Can't close without covering full debt |
+
+### Experimental CIP-0112 Probes (17 tests)
+
+These tests do not claim conformance. They document the local prototype
+boundary and keep V1 behavior covered while exercising preview V2 dependencies.
+
+| Group | Tests | Validates |
+|---|---|---|
+| Account policy | 9 | Withdrawn, minted, burn, close-change, provider-visibility, and liquidation outputs remain basic-account by default; mint/burn use special admin account ids; stale V1 vault exercises fail. |
+| Dependency markers | 2 | Liquidation settle-batch arguments compile and the local live-settlement support markers are enabled while non-release blockers remain explicit. |
+| Live settlement | 6 | Close overpayment/change/collateral return, liquidation collateral seizure/change, bad-debt liquidation, underpayment rollback, unexpired-lock contention, provider-managed account rejection, and metadata naming. |
 
 ---
 
@@ -332,6 +362,8 @@ Following RED-GREEN-REFACTOR:
 | Vault_BurnStablecoin | Archives stablecoin inputs, decreases debt, debt >= 0 |
 | Vault_Close | Returns all collateral, requires full repayment, handles overpayment |
 | Vault_Liquidate | Validates undercollateralization, seizes correct collateral, handles partial and full cases, returns change and remainder |
+| Vault_Cip112CloseWithSettlement | Experimental only: live V2 repayment burn settles through `SettlementFactory_SettleBatch`, overpayment change is returned, collateral is returned, and failed underpayment/lock paths roll back |
+| Vault_Cip112LiquidateWithSettlement | Experimental only: live V2 debt burn and collateral seizure settle in one batch, change/remainder/bad-debt reporting is explicit, and provider-managed accounts remain rejected |
 | Integration | Minted stablecoins transfer via SimpleTokenRules |
 
 ---
@@ -351,9 +383,16 @@ See [SCOPE.md](SCOPE.md) for detailed analysis.
 ## Verification
 
 1. `dpm build` from `stablecoin/` (new modules compile)
-2. `JAVA_HOME=... dpm test` from `stablecoin-test/` (all 27 tests pass -- 22 functional + 5 property-based)
-3. `JAVA_HOME=... dpm test` from `simple-token-test/` (36 existing tests still pass, no regressions)
+2. `JAVA_HOME=... dpm test` from `stablecoin-test/` (44 scripts pass -- 22 V1 CDP, 5 property-based, 17 experimental CIP-0112)
+3. `JAVA_HOME=... dpm test` from `simple-token-test/` (existing V1 tests plus experimental V2 transfer/allocation probes pass, no regressions)
 4. Verify stablecoin interop: minted stablecoin transfers via `SimpleTokenRules` in `test_mintAndTransfer`
-5. `daml-lint` static analysis: 1 finding patched, 2 false positives acknowledged (see [AUDIT.md](AUDIT.md))
-6. `daml-verify` formal proofs: 14/14 proved (9 simple-token + 5 vault)
+5. `daml-lint` static analysis: historical report has 1 finding patched and
+   2 false positives acknowledged; 2026-05-19 closeout manual root
+   `daml-lint` still reports only those 2 stablecoin false positives, while
+   `scripts/verify.sh` skips lint when it is not installed on its own search
+   path (see [AUDIT.md](AUDIT.md)).
+6. `daml-verify` formal proofs: 14/14 proved (9 simple-token + 5 vault) when
+   run manually from the workspace root tool venv; `scripts/verify.sh` skips
+   formal verification unless a stablecoin-local `tools/daml-verify` venv is
+   installed.
 7. `daml-props` property tests: 5/5 passed (200 random sequences each)

@@ -1,0 +1,431 @@
+-- | Experimental CIP-0112 TransferInstruction/TransferFactory compile probes.
+module SimpleToken.Test.Cip112Transfer where
+
+import DA.Map qualified as Map
+import DA.Text qualified as Text
+
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.TransferInstructionV2 qualified as TransferV2
+import Splice.Api.Token.TransferEventsV2 qualified as TransferEventsV2
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import SimpleToken.ContextUtils (withEventLogContext)
+import SimpleToken.Rules (SimpleTokenRules, v2TransferFactoryActorFailureMsg)
+import SimpleToken.TransferInstruction
+  ( SimpleTransferInstruction
+  , v2TransferAcceptActorFailureMsg
+  , v2TransferRejectActorFailureMsg
+  , v2TransferWithdrawActorFailureMsg
+  )
+import SimpleToken.Test.Setup
+import SimpleToken.Testing.SimpleRegistry
+import SimpleToken.Testing.WalletClient
+
+import Daml.Script
+
+-- Test-only EventLog harness. Keep this package non-uploadable while it depends
+-- on daml-script; split the harness into a separate non-script test package if
+-- these templates ever need to be uploaded.
+template TestEventLog
+  with
+    admin : Party
+    observers : [Party]
+  where
+    signatory admin
+    observer observers
+
+    interface instance TransferEventsV2.EventLog for TestEventLog where
+      view = TransferEventsV2.EventLogView with
+        admin
+        meta = emptyMetadata
+
+      eventLog_holdingsChangeImpl _selfCid arg = do
+        _ <- create TestEventLogEntry with
+          admin
+          event = arg
+          observers = observers ++ arg.observers
+        pure TransferEventsV2.EventLog_HoldingsChangeResult
+
+template TestEventLogEntry
+  with
+    admin : Party
+    event : TransferEventsV2.EventLog_HoldingsChange
+    observers : [Party]
+  where
+    signatory admin
+    observer observers
+
+mkV2Transfer
+  : SimpleRegistry
+  -> Party
+  -> Party
+  -> Decimal
+  -> [ContractId HoldingV1.Holding]
+  -> TransferV2.Transfer
+mkV2Transfer registry sender receiver amount inputHoldingCids =
+  TransferV2.Transfer with
+    sender = TokenStandard.basicAccount sender
+    receiver = TokenStandard.basicAccount receiver
+    amount
+    instrumentId = TokenStandard.upcast registry.instrumentId
+    requestedAt = demoTime
+    executeBefore = futureDeadline
+    inputHoldingCids = map TokenStandard.upcast inputHoldingCids
+    meta = emptyMetadata
+
+getV2TransferFactory : SimpleRegistry -> Script (ContractId TransferV2.TransferFactory, Disclosures)
+getV2TransferFactory registry = do
+  [(rulesCid, _)] <- query @SimpleTokenRules registry.admin
+  rulesDisc <- queryDisc @SimpleTokenRules registry.admin rulesCid
+  pure (toInterfaceContractId @TransferV2.TransferFactory rulesCid, rulesDisc)
+
+queryV2TransferInstructionDisc : Party -> ContractId TransferV2.TransferInstruction -> Script Disclosures
+queryV2TransferInstructionDisc observer instrCid =
+  queryDisc @SimpleTransferInstruction observer (coerceContractId instrCid)
+
+querySingleSimpleTransferInstruction
+  : Party
+  -> ContractId TransferV2.TransferInstruction
+  -> Script SimpleTransferInstruction
+querySingleSimpleTransferInstruction observer instrCid = do
+  instrs <- query @SimpleTransferInstruction observer
+  let matches = do
+        (cid, instr) <- instrs
+        guard (toInterfaceContractId @TransferV2.TransferInstruction cid == instrCid)
+        pure instr
+  case matches of
+    [instr] -> pure instr
+    _ -> fail $ "Expected exactly one SimpleTransferInstruction, found " <> show (length matches)
+
+createTestEventLog
+  : Party
+  -> [Party]
+  -> Script (ContractId TransferEventsV2.EventLog)
+createTestEventLog admin observers = do
+  cid <- submit admin $ createCmd TestEventLog with
+    admin
+    observers
+  pure (toInterfaceContractId @TransferEventsV2.EventLog cid)
+
+queryTestEventLogEntries
+  : Party
+  -> Script [TransferEventsV2.EventLog_HoldingsChange]
+queryTestEventLogEntries observer = do
+  entries <- query @TestEventLogEntry observer
+  pure (map (\(_, entry) -> entry.event) entries)
+
+assertSingleEvent
+  : [TransferEventsV2.EventLog_HoldingsChange]
+  -> HoldingV2.Account
+  -> [ContractId HoldingV2.Holding]
+  -> [ContractId HoldingV2.Holding]
+  -> Script ()
+assertSingleEvent events account inputHoldingCids outputHoldingCids =
+  case filter (\event -> event.account == account) events of
+    [event] -> do
+      assert (event.inputHoldingCids == inputHoldingCids)
+      assert (event.outputHoldingCids == outputHoldingCids)
+    matches -> fail $
+      "Expected exactly one event for account "
+        <> show account
+        <> ", found "
+        <> show (length matches)
+
+submitWithDiscError : Party -> Disclosures -> Commands a -> Script SubmitError
+submitWithDiscError p (Disclosures ds) cmds =
+  submitWithError (actAs p <> discloseMany ds) cmds
+
+assertSubmitErrorContains : Text -> SubmitError -> Script ()
+assertSubmitErrorContains expected err =
+  assertMsg
+    ("Expected submit error to contain " <> show expected <> ", got: " <> show err)
+    (expected `Text.isInfixOf` show err)
+
+createPendingV2Transfer
+  : SimpleRegistry
+  -> Party
+  -> Party
+  -> Decimal
+  -> [ContractId HoldingV1.Holding]
+  -> Script (ContractId TransferV2.TransferInstruction)
+createPendingV2Transfer registry sender receiver amount inputHoldingCids = do
+  (tfCid, rulesDisc) <- getV2TransferFactory registry
+  result <- submitWithDisc sender rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkV2Transfer registry sender receiver amount inputHoldingCids
+      actors = [sender]
+      extraArgs = emptyExtraArgs
+  case result.output of
+    TransferV2.TransferInstructionResult_Pending instrCid -> pure instrCid
+    _ -> fail "Expected V2 transfer to create a pending instruction"
+
+querySingleV2TransferInstruction
+  : Party
+  -> ContractId TransferV2.TransferInstruction
+  -> Script TransferV2.TransferInstructionView
+querySingleV2TransferInstruction observer instrCid = do
+  instrs <- queryInterface @TransferV2.TransferInstruction observer
+  let matches = do
+        (cid, Some instrView) <- instrs
+        guard (cid == instrCid)
+        pure instrView
+  case matches of
+    [instrView] -> pure instrView
+    _ -> fail $ "Expected exactly one V2 transfer instruction, found " <> show (length matches)
+
+assertNoV2TransferInstruction : Party -> ContractId TransferV2.TransferInstruction -> Script ()
+assertNoV2TransferInstruction observer instrCid = do
+  instrs <- queryInterface @TransferV2.TransferInstruction observer
+  let matches = do
+        (cid, Some _instrView) <- instrs
+        guard (cid == instrCid)
+        pure cid
+  assert (null matches)
+
+assertPendingBasicActions : Party -> Party -> TransferV2.TransferInstructionView -> Script ()
+assertPendingBasicActions sender receiver instrView = do
+  assert (instrView.transfer.sender == TokenStandard.basicAccount sender)
+  assert (instrView.transfer.receiver == TokenStandard.basicAccount receiver)
+  assert (instrView.availableActions == Map.fromList
+    [ (TransferV2.TIA_Withdraw, [[sender]])
+    , (TransferV2.TIA_Accept, [[receiver]])
+    , (TransferV2.TIA_Reject, [[receiver]])
+    ])
+
+-- | V2 factory initiation creates a V2 instruction with basic-account actions.
+test_v2TransferFactoryPendingAvailableActions : Script ()
+test_v2TransferFactoryPendingAvailableActions = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  [h1] <- fundParty registry alice 100.0
+  (tfCid, rulesDisc) <- getV2TransferFactory registry
+
+  result <- submitWithDisc alice rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkV2Transfer registry alice bob 70.0 [h1]
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+
+  case result.output of
+    TransferV2.TransferInstructionResult_Pending instrCid -> do
+      instrView <- querySingleV2TransferInstruction bob instrCid
+      assertPendingBasicActions alice bob instrView
+    _ -> fail "Expected V2 transfer to create a pending instruction"
+
+-- | V2 accept delegates to the existing V1 accept path and archives the instruction.
+test_v2TransferInstructionAcceptArchivesAndCompletes : Script ()
+test_v2TransferInstructionAcceptArchivesAndCompletes = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  [h1] <- fundParty registry alice 100.0
+  (tfCid, rulesDisc) <- getV2TransferFactory registry
+
+  result <- submitWithDisc alice rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkV2Transfer registry alice bob 70.0 [h1]
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+
+  case result.output of
+    TransferV2.TransferInstructionResult_Pending instrCid -> do
+      acceptResult <- submit bob $
+        exerciseCmd instrCid TransferV2.TransferInstruction_Accept with
+          actors = [bob]
+          extraArgs = emptyExtraArgs
+      case acceptResult.output of
+        TransferV2.TransferInstructionResult_Completed receiverCids -> do
+          assert (length receiverCids == 1)
+        _ -> fail "Expected Completed after V2 accept"
+      assertNoV2TransferInstruction bob instrCid
+      checkBalance alice registry.instrumentId 30.0
+      checkBalance bob registry.instrumentId 70.0
+    _ -> fail "Expected V2 transfer to create a pending instruction"
+
+-- | V2 transfer accept can report transfer events when the EventLog is explicitly disclosed.
+test_v2TransferInstructionAcceptWithEventLogContext : Script ()
+test_v2TransferInstructionAcceptWithEventLogContext = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  [h1] <- fundParty registry alice 100.0
+  (tfCid, rulesDisc) <- getV2TransferFactory registry
+  eventLogCid <- createTestEventLog registry.admin [alice, bob]
+
+  result <- submitWithDisc alice rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkV2Transfer registry alice bob 70.0 [h1]
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+
+  case result.output of
+    TransferV2.TransferInstructionResult_Pending instrCid -> do
+      instr <- querySingleSimpleTransferInstruction bob instrCid
+      acceptResult <- submit bob $
+        exerciseCmd instrCid TransferV2.TransferInstruction_Accept with
+          actors = [bob]
+          extraArgs = withEventLogContext eventLogCid emptyExtraArgs
+      case acceptResult.output of
+        TransferV2.TransferInstructionResult_Completed receiverCids -> do
+          assert (length receiverCids == 1)
+          events <- queryTestEventLogEntries registry.admin
+          let lockedInputCid = toInterfaceContractId @HoldingV2.Holding instr.lockedHoldingCid
+          assert (length events == 2)
+          assertSingleEvent events (TokenStandard.basicAccount alice) [lockedInputCid] acceptResult.senderChangeCids
+          assertSingleEvent events (TokenStandard.basicAccount bob) [] receiverCids
+        _ -> fail "Expected Completed after V2 accept with EventLog context"
+      assertNoV2TransferInstruction bob instrCid
+      checkBalance alice registry.instrumentId 30.0
+      checkBalance bob registry.instrumentId 70.0
+    _ -> fail "Expected V2 transfer to create a pending instruction"
+
+-- | EventLog context supplied at factory time is not stored for a later receiver accept.
+test_v2TransferInstructionAcceptIgnoresFactoryEventLogContext : Script ()
+test_v2TransferInstructionAcceptIgnoresFactoryEventLogContext = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  [h1] <- fundParty registry alice 100.0
+  (tfCid, rulesDisc) <- getV2TransferFactory registry
+  eventLogCid <- createTestEventLog registry.admin [alice, bob]
+
+  result <- submitWithDisc alice rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkV2Transfer registry alice bob 70.0 [h1]
+      actors = [alice]
+      extraArgs = withEventLogContext eventLogCid emptyExtraArgs
+
+  case result.output of
+    TransferV2.TransferInstructionResult_Pending instrCid -> do
+      acceptResult <- submit bob $
+        exerciseCmd instrCid TransferV2.TransferInstruction_Accept with
+          actors = [bob]
+          extraArgs = emptyExtraArgs
+      case acceptResult.output of
+        TransferV2.TransferInstructionResult_Completed receiverCids ->
+          assert (length receiverCids == 1)
+        _ -> fail "Expected Completed after V2 accept without accept EventLog context"
+      events <- queryTestEventLogEntries registry.admin
+      assert (null events)
+      checkBalance alice registry.instrumentId 30.0
+      checkBalance bob registry.instrumentId 70.0
+    _ -> fail "Expected V2 transfer to create a pending instruction"
+
+-- | Non-basic accounts are rejected in this experimental slice.
+test_v2TransferFactoryRejectsNonBasicReceiverAccount : Script ()
+test_v2TransferFactoryRejectsNonBasicReceiverAccount = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  [h1] <- fundParty registry alice 100.0
+  (tfCid, rulesDisc) <- getV2TransferFactory registry
+  let transfer = (mkV2Transfer registry alice bob 70.0 [h1]) with
+        receiver = HoldingV2.Account with
+          owner = Some bob
+          provider = None
+          id = "non-basic"
+
+  submitWithDiscMustFail alice rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+  checkBalance alice registry.instrumentId 100.0
+
+-- | Sender account must also be the default basic account in this slice.
+test_v2TransferFactoryRejectsNonBasicSenderAccount : Script ()
+test_v2TransferFactoryRejectsNonBasicSenderAccount = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  [h1] <- fundParty registry alice 100.0
+  (tfCid, rulesDisc) <- getV2TransferFactory registry
+  let transfer = (mkV2Transfer registry alice bob 70.0 [h1]) with
+        sender = HoldingV2.Account with
+          owner = Some alice
+          provider = None
+          id = "non-basic"
+
+  submitWithDiscMustFail alice rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+  checkBalance alice registry.instrumentId 100.0
+
+-- | The V2 factory must reject actors other than the basic sender owner.
+test_v2TransferFactoryRejectsWrongActor : Script ()
+test_v2TransferFactoryRejectsWrongActor = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      charlie = parties.charlie
+  [h1] <- fundParty registry alice 100.0
+  (tfCid, rulesDisc) <- getV2TransferFactory registry
+
+  err <- submitWithDiscError charlie rulesDisc $
+    exerciseCmd tfCid TransferV2.TransferFactory_Transfer with
+      transfer = mkV2Transfer registry alice bob 70.0 [h1]
+      actors = [charlie]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains v2TransferFactoryActorFailureMsg err
+  checkBalance alice registry.instrumentId 100.0
+
+-- | V2 reject delegates to V1, rejects wrong actors, returns funds, and archives.
+test_v2TransferInstructionRejectArchivesAndRejectsWrongActors : Script ()
+test_v2TransferInstructionRejectArchivesAndRejectsWrongActors = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      charlie = parties.charlie
+  [h1] <- fundParty registry alice 100.0
+  instrCid <- createPendingV2Transfer registry alice bob 70.0 [h1]
+  instrDisc <- queryV2TransferInstructionDisc bob instrCid
+
+  acceptErr <- submitWithDiscError charlie instrDisc $
+    exerciseCmd instrCid TransferV2.TransferInstruction_Accept with
+      actors = [charlie]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains v2TransferAcceptActorFailureMsg acceptErr
+  rejectErr <- submitWithDiscError alice instrDisc $
+    exerciseCmd instrCid TransferV2.TransferInstruction_Reject with
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains v2TransferRejectActorFailureMsg rejectErr
+  withdrawErr <- submitWithDiscError bob instrDisc $
+    exerciseCmd instrCid TransferV2.TransferInstruction_Withdraw with
+      actors = [bob]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains v2TransferWithdrawActorFailureMsg withdrawErr
+
+  rejectResult <- submit bob $
+    exerciseCmd instrCid TransferV2.TransferInstruction_Reject with
+      actors = [bob]
+      extraArgs = emptyExtraArgs
+  case rejectResult.output of
+    TransferV2.TransferInstructionResult_Failed -> pure ()
+    _ -> fail "Expected Failed after V2 reject"
+  assertNoV2TransferInstruction bob instrCid
+  checkBalance alice registry.instrumentId 100.0
+
+-- | V2 withdraw delegates to V1, returns funds, and archives.
+test_v2TransferInstructionWithdrawArchivesAndReturnsFunds : Script ()
+test_v2TransferInstructionWithdrawArchivesAndReturnsFunds = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+  [h1] <- fundParty registry alice 100.0
+  instrCid <- createPendingV2Transfer registry alice bob 70.0 [h1]
+
+  withdrawResult <- submit alice $
+    exerciseCmd instrCid TransferV2.TransferInstruction_Withdraw with
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+  case withdrawResult.output of
+    TransferV2.TransferInstructionResult_Failed -> pure ()
+    _ -> fail "Expected Failed after V2 withdraw"
+  assertNoV2TransferInstruction bob instrCid
+  checkBalance alice registry.instrumentId 100.0

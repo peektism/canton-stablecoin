@@ -2,12 +2,45 @@
 -- SimpleAllocation: backed by a locked holding, supports execute/cancel/withdraw.
 module SimpleToken.Allocation where
 
+import DA.Map qualified as Map
+import DA.TextMap qualified as TextMap
+
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
 import Splice.Api.Token.AllocationV1
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
+import Splice.Api.Token.TransferEventsV2 qualified as TransferEventsV2
+import Splice.TokenStandard.Utils qualified as TokenStandard
 
 import SimpleToken.Holding
 import SimpleToken.ContextUtils
+
+-- | Experimental V2 actor guard markers used before creating or changing V2 allocations.
+v2AllocationInstructionAcceptActorFailureMsg : Text
+v2AllocationInstructionAcceptActorFailureMsg =
+  "SimpleToken V2 AllocationInstruction_Accept: actors must equal the basic authorizer owner"
+
+v2AllocationInstructionWithdrawActorFailureMsg : Text
+v2AllocationInstructionWithdrawActorFailureMsg =
+  "SimpleToken V2 AllocationInstruction_Withdraw: actors must equal the basic authorizer owner"
+
+v2AllocationWithdrawActorFailureMsg : Text
+v2AllocationWithdrawActorFailureMsg =
+  "SimpleToken V2 Allocation_Withdraw: actors must equal the basic authorizer owner"
+
+v2AllocationCancelActorFailureMsg : Text
+v2AllocationCancelActorFailureMsg =
+  "SimpleToken V2 Allocation_Cancel: actors must equal settlement executors"
+
+v2AllocationSettleActorFailureMsg : Text
+v2AllocationSettleActorFailureMsg =
+  "SimpleToken V2 Allocation_Settle: actors must equal admin plus settlement executors"
+
+v2AllocationSettleIteratedUnsupportedFailureMsg : Text
+v2AllocationSettleIteratedUnsupportedFailureMsg =
+  "SimpleToken V2 Allocation_Settle: iterated settlement arguments are not supported"
 
 -- | A funded allocation of holdings to a settlement leg.
 template SimpleAllocation
@@ -106,3 +139,386 @@ releaseAllocatedFunds admin allocation lockedHoldingCid extraArgs = do
       pure Allocation_CancelResult with
         senderHoldingCids = []
         meta = txKindMeta "transfer"
+
+
+-- Experimental CIP-0112 V2 AllocationInstruction/Allocation prototype.
+-- This slice supports providerless default accounts plus the preview mint/burn
+-- admin accounts needed for stablecoin repayment and liquidation settlement.
+
+-- | Pending V2 allocation instruction. It defers input consumption until accept
+-- so the instruction flow can be exercised without introducing provider state.
+template SimpleAllocationInstructionV2
+  with
+    admin : Party
+    allocation : AllocationV2.AllocationSpecification
+    requestedAt : Time
+    inputHoldingCids : [ContractId HoldingV2.Holding]
+    inputHoldingCidMap : TextMap.TextMap [ContractId HoldingV2.Holding]
+    originalInstructionCid : Optional (ContractId AllocationInstructionV2.AllocationInstruction)
+  where
+    ensure isSupportedV2Allocation allocation
+    signatory admin, v2AllocationAuthorizer admin allocation
+    observer allocation.settlement.executors
+
+    interface instance AllocationInstructionV2.AllocationInstruction for SimpleAllocationInstructionV2 where
+      view = AllocationInstructionV2.AllocationInstructionView with
+        originalInstructionCid
+        allocation
+        requestedAt
+        inputHoldingCids
+        expiresAt = allocation.settlement.settlementDeadline
+        availableActions = v2AllocationInstructionActions admin allocation
+        meta = emptyMetadata
+
+      allocationInstruction_acceptExtraObservers _arg = []
+      allocationInstruction_withdrawExtraObservers _arg = allocation.settlement.executors
+
+      allocationInstruction_acceptImpl selfCid arg = do
+        let authorizer = v2AllocationAuthorizer admin allocation
+        assertMsg v2AllocationInstructionAcceptActorFailureMsg (arg.actors == [authorizer])
+        assertV2AllocationNotExpired allocation
+        archive selfCid
+        (lockedHoldingCids, authorizerChangeCids) <-
+          archiveAndLockV2AllocationInputs admin allocation inputHoldingCids
+        allocationCid <- create SimpleAllocationV2 with
+          admin
+          allocation
+          lockedHoldingCids
+          createdAt = requestedAt
+          originalAllocationCid = None
+        pure AllocationInstructionV2.AllocationInstructionResult with
+          output = AllocationInstructionV2.AllocationInstructionResult_Completed with
+            allocationCid = toInterfaceContractId @AllocationV2.Allocation allocationCid
+          authorizerChangeCids
+          meta = emptyMetadata
+
+      allocationInstruction_withdrawImpl selfCid arg = do
+        let authorizer = v2AllocationAuthorizer admin allocation
+        assertMsg v2AllocationInstructionWithdrawActorFailureMsg (arg.actors == [authorizer])
+        archive selfCid
+        pure AllocationInstructionV2.AllocationInstructionResult with
+          output = AllocationInstructionV2.AllocationInstructionResult_Failed
+          authorizerChangeCids = inputHoldingCidMap
+          meta = emptyMetadata
+
+
+-- | Experimental V2 allocation backed by locked SimpleToken holdings.
+template SimpleAllocationV2
+  with
+    admin : Party
+    allocation : AllocationV2.AllocationSpecification
+    lockedHoldingCids : TextMap.TextMap [ContractId HoldingV2.Holding]
+    createdAt : Time
+    originalAllocationCid : Optional (ContractId AllocationV2.Allocation)
+  where
+    ensure isSupportedV2Allocation allocation
+    signatory admin, v2AllocationAuthorizer admin allocation
+    observer allocation.settlement.executors
+
+    interface instance AllocationV2.Allocation for SimpleAllocationV2 where
+      view = AllocationV2.AllocationView with
+        originalAllocationCid
+        allocation
+        holdingCids = flattenTextMap lockedHoldingCids
+        createdAt
+        numIterations = 0
+        expiresAt = allocation.settlement.settlementDeadline
+        availableActions = v2AllocationActions admin allocation
+        meta = emptyMetadata
+
+      allocation_settleExtraObservers _arg = []
+      allocation_cancelExtraObservers _arg = []
+      allocation_withdrawExtraObservers _arg = allocation.settlement.executors
+
+      allocation_settleImpl selfCid arg = do
+        assertMsg v2AllocationSettleActorFailureMsg
+          (samePartySet (dedupParties (admin :: allocation.settlement.executors)) arg.actors)
+        let noNextIterationFunding = case arg.nextIterationFunding of
+              None -> True
+              Some _ -> False
+        assertMsg v2AllocationSettleIteratedUnsupportedFailureMsg
+          (null arg.extraTransferLegSides && noNextIterationFunding)
+        assertV2AllocationSettlementOpen allocation
+        archive selfCid
+        (inputHoldingCids, authorizerHoldingCids) <-
+          settleV2AllocationFunds admin allocation lockedHoldingCids
+        eventLogCid <- lookupFromContextU @(ContractId TransferEventsV2.EventLog)
+          arg.extraArgs.context
+          eventLogContextKey
+        case eventLogCid of
+          None -> pure ()
+          Some logCid ->
+            TokenStandard.logAllocationSettlement
+              logCid
+              inputHoldingCids
+              allocation
+              (flattenTextMap authorizerHoldingCids)
+        pure AllocationV2.AllocationResult with
+          output = AllocationV2.AllocationResult_Settled with
+            nextIterationAllocationCid = None
+          authorizerHoldingCids
+          meta = emptyMetadata
+
+      allocation_cancelImpl selfCid arg = do
+        assertMsg v2AllocationCancelActorFailureMsg
+          (samePartySet allocation.settlement.executors arg.actors)
+        archive selfCid
+        authorizerHoldingCids <- unlockV2AllocationFunds admin allocation lockedHoldingCids
+        pure AllocationV2.AllocationResult with
+          output = AllocationV2.AllocationResult_Cancelled
+          authorizerHoldingCids
+          meta = emptyMetadata
+
+      allocation_withdrawImpl selfCid arg = do
+        let authorizer = v2AllocationAuthorizer admin allocation
+        assertMsg v2AllocationWithdrawActorFailureMsg (arg.actors == [authorizer])
+        TokenStandard.ensureWithdrawIsAllowed allocation
+        archive selfCid
+        authorizerHoldingCids <- unlockV2AllocationFunds admin allocation lockedHoldingCids
+        pure AllocationV2.AllocationResult with
+          output = AllocationV2.AllocationResult_Withdrawn
+          authorizerHoldingCids
+          meta = emptyMetadata
+
+
+isSupportedV2Allocation : AllocationV2.AllocationSpecification -> Bool
+isSupportedV2Allocation allocation =
+  isSupportedV2AllocationAccount allocation.admin allocation.authorizer &&
+  all (\leg -> isSupportedV2AllocationAccount allocation.admin leg.otherside) allocation.transferLegSides
+
+-- | Stablecoin live-settlement support keeps regular holdings basic-account
+-- only, but permits the preview special mint/burn accounts as zero-holding
+-- allocation authorizers.
+isSupportedV2AllocationAccount : Party -> HoldingV2.Account -> Bool
+isSupportedV2AllocationAccount admin account =
+  TokenStandard.isBasicAccount account ||
+  account == TokenStandard.mintAccount admin ||
+  account == TokenStandard.burnAccount admin
+
+v2AllocationAuthorizer : Party -> AllocationV2.AllocationSpecification -> Party
+v2AllocationAuthorizer admin allocation =
+  TokenStandard.accountPrincipal admin allocation.authorizer
+
+v2AllocationInstructionActions
+  : Party -> AllocationV2.AllocationSpecification
+  -> Map.Map AllocationInstructionV2.AllocationInstructionAction [[Party]]
+v2AllocationInstructionActions admin allocation =
+  Map.fromList
+    [ (AllocationInstructionV2.AIA_Accept, [[authorizer]])
+    , (AllocationInstructionV2.AIA_Withdraw, [[authorizer]])
+    ]
+  where
+    authorizer = v2AllocationAuthorizer admin allocation
+
+v2AllocationActions
+  : Party -> AllocationV2.AllocationSpecification
+  -> Map.Map AllocationV2.AllocationAction [[Party]]
+v2AllocationActions admin allocation =
+  Map.fromList
+    [ (AllocationV2.AA_Withdraw, [[v2AllocationAuthorizer admin allocation]])
+    , (AllocationV2.AA_Cancel, [allocation.settlement.executors])
+    , (AllocationV2.AA_Settle, [dedupParties (admin :: allocation.settlement.executors)])
+    ]
+
+samePartySet : [Party] -> [Party] -> Bool
+samePartySet expected actual =
+  let
+    expectedSet = dedupParties expected
+    actualSet = dedupParties actual
+  in
+    length expectedSet == length actualSet &&
+    all (\party -> party `elem` actualSet) expectedSet &&
+    all (\party -> party `elem` expectedSet) actualSet
+
+dedupParties : [Party] -> [Party]
+dedupParties parties = case parties of
+  [] -> []
+  party :: rest ->
+    if party `elem` rest
+      then dedupParties rest
+      else party :: dedupParties rest
+
+assertV2AllocationNotExpired : AllocationV2.AllocationSpecification -> Update ()
+assertV2AllocationNotExpired allocation = do
+  now <- getTime
+  case allocation.settlement.settlementDeadline of
+    None -> pure ()
+    Some deadline ->
+      assertMsg "Allocation instruction has expired" (now < deadline)
+
+assertV2AllocationSettlementOpen : AllocationV2.AllocationSpecification -> Update ()
+assertV2AllocationSettlementOpen allocation = do
+  now <- getTime
+  case allocation.settlement.settlementDeadline of
+    None -> pure ()
+    Some deadline ->
+      assertMsg "V2 allocation settlement deadline has passed" (now < deadline)
+
+archiveAndLockV2AllocationInputs
+  : Party
+  -> AllocationV2.AllocationSpecification
+  -> [ContractId HoldingV2.Holding]
+  -> Update
+       ( TextMap.TextMap [ContractId HoldingV2.Holding]
+       , TextMap.TextMap [ContractId HoldingV2.Holding]
+       )
+archiveAndLockV2AllocationInputs admin allocation inputHoldingCids = do
+  now <- getTime
+  inputEntries <- forA inputHoldingCids $ \holdingCid -> do
+    holdingI <- fetch holdingCid
+    let holding = view holdingI
+    assertMsg "V2 allocation input account must match allocation authorizer"
+      (holding.account == allocation.authorizer)
+    assertMsg "V2 allocation input admin must match allocation admin"
+      (holding.instrumentId.admin == admin)
+    case holding.lock of
+      None -> pure ()
+      Some lock -> do
+        let lockExpired = case lock.expiresAt of
+              None -> False
+              Some t -> now >= t
+        assertMsg "Cannot use V2 holding with unexpired lock as allocation input"
+          lockExpired
+    archive holdingCid
+    pure (holding.instrumentId.id, holding.amount)
+
+  let
+    inputAmounts = TextMap.fromListWithR (+) inputEntries
+    creditAmounts =
+      TokenStandard.netAllocationCreditAmounts admin allocation.authorizer allocation.transferLegSides
+    combinedAmounts = TokenStandard.textMapZipWithDefault 0.0 inputAmounts creditAmounts
+
+  outputs <- forA (TextMap.toList combinedAmounts) $ \(instrumentId, (inputAmount, creditAmount)) -> do
+    let
+      requiredDebit = negate (min 0.0 creditAmount)
+      changeAmount = inputAmount - requiredDebit
+    assertMsg
+      ("Insufficient V2 allocation funds for " <> instrumentId <> ": have "
+        <> show inputAmount <> " but need " <> show requiredDebit)
+      (changeAmount >= 0.0)
+
+    locked <- if requiredDebit > 0.0
+      then do
+        lockedCid <- create LockedSimpleHolding with
+          admin
+          owner = v2AllocationAuthorizer admin allocation
+          instrumentId = InstrumentId with admin; id = instrumentId
+          amount = requiredDebit
+          lock = Lock with
+            holders = [admin]
+            expiresAt = allocation.settlement.settlementDeadline
+            expiresAfter = None
+            context = Some ("v2-allocation:" <> allocation.settlement.settlementRef.id)
+          extraObservers = allocation.settlement.executors
+          meta = emptyMetadata
+        pure [(instrumentId, [toInterfaceContractId @HoldingV2.Holding lockedCid])]
+      else pure []
+
+    change <- if changeAmount > 0.0
+      then do
+        changeCid <- create SimpleHolding with
+          admin
+          owner = v2AllocationAuthorizer admin allocation
+          instrumentId = InstrumentId with admin; id = instrumentId
+          amount = changeAmount
+          meta = emptyMetadata
+        pure [(instrumentId, [toInterfaceContractId @HoldingV2.Holding changeCid])]
+      else pure []
+
+    pure (locked, change)
+
+  pure
+    ( TextMap.fromListWithR (++) (concatMap fst outputs)
+    , TextMap.fromListWithR (++) (concatMap snd outputs)
+    )
+
+settleV2AllocationFunds
+  : Party
+  -> AllocationV2.AllocationSpecification
+  -> TextMap.TextMap [ContractId HoldingV2.Holding]
+  -> Update
+       ( [ContractId HoldingV2.Holding]
+       , TextMap.TextMap [ContractId HoldingV2.Holding]
+       )
+settleV2AllocationFunds admin allocation lockedHoldingCids = do
+  debitEntries <- forA (flattenTextMap lockedHoldingCids) $ \lockedCid -> do
+    lockedI <- fetch lockedCid
+    let locked = view lockedI
+    assertMsg "V2 settlement locked allocation account must match allocation authorizer"
+      (locked.account == allocation.authorizer)
+    assertMsg "V2 settlement locked allocation admin must match allocation admin"
+      (locked.instrumentId.admin == admin)
+    archive lockedCid
+    pure (locked.instrumentId.id, locked.amount)
+
+  let
+    debitAmounts = TextMap.fromListWithR (+) debitEntries
+    creditAmounts =
+      TokenStandard.netAllocationCreditAmounts admin allocation.authorizer allocation.transferLegSides
+    combinedAmounts = TokenStandard.textMapZipWithDefault 0.0 debitAmounts creditAmounts
+
+  outputEntries <- forA (TextMap.toList combinedAmounts) $ \(instrumentId, (debitAmount, creditAmount)) -> do
+    let requiredDebit = negate (min 0.0 creditAmount)
+    assertMsg
+      ("V2 settlement locked debit mismatch for " <> instrumentId <> ": locked "
+        <> show debitAmount <> " but expected " <> show requiredDebit)
+      (debitAmount == requiredDebit)
+    if creditAmount > 0.0 then
+      if isV2BurnAllocation admin allocation then do
+        -- The special burn account is a sink, not an admin-owned regular
+        -- account. Do not materialize positive burn credits as holdings.
+        pure []
+      else do
+        outputCid <- create SimpleHolding with
+          admin
+          owner = v2AllocationAuthorizer admin allocation
+          instrumentId = InstrumentId with admin; id = instrumentId
+          amount = creditAmount
+          meta = emptyMetadata
+        pure [(instrumentId, [toInterfaceContractId @HoldingV2.Holding outputCid])]
+      else pure []
+
+  pure
+    ( flattenTextMap lockedHoldingCids
+    , TextMap.fromListWithR (++) (concat outputEntries)
+    )
+
+isV2BurnAllocation : Party -> AllocationV2.AllocationSpecification -> Bool
+isV2BurnAllocation admin allocation =
+  allocation.authorizer == TokenStandard.burnAccount admin
+
+v2AllocationInputCidMap
+  : [ContractId HoldingV2.Holding]
+  -> Update (TextMap.TextMap [ContractId HoldingV2.Holding])
+v2AllocationInputCidMap holdingCids = do
+  entries <- forA holdingCids $ \holdingCid -> do
+    holdingI <- fetch holdingCid
+    let holding = view holdingI
+    pure (holding.instrumentId.id, [holdingCid])
+  pure (TextMap.fromListWithR (++) entries)
+
+unlockV2AllocationFunds
+  : Party
+  -> AllocationV2.AllocationSpecification
+  -> TextMap.TextMap [ContractId HoldingV2.Holding]
+  -> Update (TextMap.TextMap [ContractId HoldingV2.Holding])
+unlockV2AllocationFunds admin allocation lockedHoldingCids = do
+  entries <- forA (flattenTextMap lockedHoldingCids) $ \lockedCid -> do
+    lockedI <- fetch lockedCid
+    let locked = view lockedI
+    assertMsg "V2 locked allocation account must match allocation authorizer"
+      (locked.account == allocation.authorizer)
+    assertMsg "V2 locked allocation admin must match allocation admin"
+      (locked.instrumentId.admin == admin)
+    archive lockedCid
+    returnCid <- create SimpleHolding with
+      admin
+      owner = v2AllocationAuthorizer admin allocation
+      instrumentId = InstrumentId with admin = locked.instrumentId.admin; id = locked.instrumentId.id
+      amount = locked.amount
+      meta = emptyMetadata
+    pure (locked.instrumentId.id, [toInterfaceContractId @HoldingV2.Holding returnCid])
+  pure (TextMap.fromListWithR (++) entries)
+
+flattenTextMap : TextMap.TextMap [a] -> [a]
+flattenTextMap values = concatMap snd (TextMap.toList values)

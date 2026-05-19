@@ -1,0 +1,240 @@
+-- | Experimental CIP-0112 account-policy probes for existing CDP flows.
+-- These tests do not exercise V2 interfaces; they prove the local CDP outputs
+-- can be projected into the intended account policy while V1 behavior remains.
+module Stablecoin.Test.Cip112AccountPolicy where
+
+import DA.Optional (isNone, isSome)
+
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1
+
+import SimpleToken.Holding (SimpleHolding(..))
+
+import Stablecoin.Experimental.Cip112.AccountPolicy
+import Stablecoin.Oracle
+import Stablecoin.Test.Cdp
+import Stablecoin.Vault
+
+assertBasicFor : Text -> Party -> Cip112Account -> Script ()
+assertBasicFor label owner account = do
+  assertMsg (label <> " should project to basicAccount owner")
+    (account == cip112BasicAccount owner)
+  assertMsg (label <> " should not require provider authority")
+    (not (cip112UsesProvider account))
+  assertMsg (label <> " principal should be the owner")
+    (cip112AccountPrincipal owner account == owner)
+
+findSimpleHoldings
+  : Party -> InstrumentId -> Decimal -> Script [SimpleHolding]
+findSimpleHoldings observer instrumentId amount = do
+  holdings <- query @SimpleHolding observer
+  pure [ holding | (_, holding) <- holdings
+                 , holding.instrumentId == instrumentId
+                 , holding.amount == amount
+       ]
+
+test_cip112WithdrawnHoldingsStayBasicAccount : Script ()
+test_cip112WithdrawnHoldingsStayBasicAccount = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+  (_vaultCid3, collateralCid) <- submit env.alice $ exerciseCmd vaultCid2 Vault_WithdrawCollateral with
+    withdrawAmount = 2.0
+    oracleCid = env.oracleCid
+  holding <- fetchHolding env.alice collateralCid
+  assertMsg "withdraw output remains owned by vault owner"
+    (holding.owner == env.alice)
+  assertMsg "withdraw output remains collateral instrument"
+    (holding.instrumentId == env.collateralInstrumentId)
+  assertBasicFor "withdrawn collateral" env.alice
+    (cip112WithdrawnHoldingAccount holding.owner)
+
+test_cip112MintBurnUseSpecialAdminAccounts : Script ()
+test_cip112MintBurnUseSpecialAdminAccounts = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, stablecoinCid) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+  stablecoin <- fetchHolding env.alice stablecoinCid
+
+  let mintSource = cip112MintAccount env.admin
+  assertMsg "mint source uses CIP-112 account id"
+    (mintSource.id == cip112MintAccountId)
+  assertMsg "mint source principal resolves to admin"
+    (cip112AccountPrincipal env.admin mintSource == env.admin)
+  assertMsg "mint source should not be a provider-managed owner account"
+    (not (cip112UsesProvider mintSource))
+  assertBasicFor "minted stablecoin output" env.alice
+    (cip112MintedHoldingAccount stablecoin.owner)
+
+  let burnSink = cip112BurnAccount env.admin
+  assertMsg "burn sink uses CIP-112 account id"
+    (burnSink.id == cip112BurnAccountId)
+  assertMsg "burn sink principal resolves to admin"
+    (cip112AccountPrincipal env.admin burnSink == env.admin)
+  assertBasicFor "burn input" env.alice
+    (cip112BurnInputAccount stablecoin.owner)
+
+  _vaultCid3 <- submit env.alice $ exerciseCmd vaultCid2 Vault_BurnStablecoin with
+    stablecoinHoldingCids = [toInterfaceContractId @Holding stablecoinCid]
+  pure ()
+
+test_cip112BurnRepayArchivesInputAndClearsDebt : Script ()
+test_cip112BurnRepayArchivesInputAndClearsDebt = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, stablecoinCid) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+
+  vaultCid3 <- submit env.alice $ exerciseCmd vaultCid2 Vault_BurnStablecoin with
+    stablecoinHoldingCids = [toInterfaceContractId @Holding stablecoinCid]
+  burnedInput <- queryContractId env.alice stablecoinCid
+  vault <- fetchVault env.alice vaultCid3
+  assertMsg "burn input should be archived"
+    (isNone burnedInput)
+  assertMsg "burn repay should clear debt"
+    (vault.debtAmount == 0.0)
+  assertBasicFor "burn repay input" env.alice
+    (cip112BurnInputAccount env.alice)
+
+test_cip112CloseOverpaymentReturnsBasicAccountChange : Script ()
+test_cip112CloseOverpaymentReturnsBasicAccountChange = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+  repayCid <- fundStablecoin env env.alice 6000.0
+  collateralCid <- submit env.alice $ exerciseCmd vaultCid2 Vault_Close with
+    stablecoinHoldingCids = [repayCid]
+
+  collateral <- fetchHolding env.alice collateralCid
+  assertMsg "close returns all collateral"
+    (collateral.amount == 10.0 && collateral.instrumentId == env.collateralInstrumentId)
+  changeHoldings <- findSimpleHoldings env.alice env.stablecoinInstrumentId 1000.0
+  case changeHoldings of
+    change :: _ -> do
+      assertBasicFor "close overpayment stablecoin change" change.owner
+        (cip112MintedHoldingAccount change.owner)
+    [] -> fail "expected 1000 stablecoin change from close overpayment"
+
+test_cip112CloseArchivesVaultAndStaleWithdrawFails : Script ()
+test_cip112CloseArchivesVaultAndStaleWithdrawFails = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+  repayCid <- fundStablecoin env env.alice 5000.0
+  _collateralCid <- submit env.alice $ exerciseCmd vaultCid2 Vault_Close with
+    stablecoinHoldingCids = [repayCid]
+  closedVault <- queryContractId env.alice vaultCid2
+  assertMsg "close should archive the vault"
+    (isNone closedVault)
+  submitMustFail env.alice $ exerciseCmd vaultCid2 Vault_WithdrawCollateral with
+    withdrawAmount = 1.0
+    oracleCid = env.oracleCid
+
+test_cip112ProviderVisibilityDoesNotExpandToThirdParty : Script ()
+test_cip112ProviderVisibilityDoesNotExpandToThirdParty = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (_, stablecoinCid) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 5000.0
+    oracleCid = env.oracleCid
+
+  adminView <- fetchHolding env.admin stablecoinCid
+  charlieView <- queryContractId env.charlie stablecoinCid
+  assertMsg "V1 admin signatory visibility remains explicit"
+    (adminView.owner == env.alice)
+  assertMsg "unrelated third party should not gain provider visibility"
+    (isNone charlieView)
+  assertMsg "basic account policy adds no provider party"
+    (cip112AccountParties env.admin (cip112MintedHoldingAccount env.alice) == [env.alice])
+
+test_cip112VaultCollateralProviderAuthorityRequiresProof : Script ()
+test_cip112VaultCollateralProviderAuthorityRequiresProof = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  vault <- fetchVault env.alice vaultCid
+
+  assertBasicFor "vault collateral default" vault.owner
+    (cip112VaultCollateralDefaultAccount vault.owner)
+
+  let providerCandidate =
+        cip112ProviderManagedCollateralCandidate vault.admin vault.owner
+  assertMsg "provider candidate records admin provider"
+    (providerCandidate.provider == Some vault.admin)
+  assertMsg "provider candidate is intentionally not the default"
+    (providerCandidate /= cip112VaultCollateralDefaultAccount vault.owner)
+  assertMsg "provider candidate would require provider visibility"
+    (cip112AccountParties vault.admin providerCandidate == [vault.owner, vault.admin])
+
+test_cip112LiquidationOutputsStayBasicAndBatchSettlementLive : Script ()
+test_cip112LiquidationOutputsStayBasicAndBatchSettlementLive = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 12000.0
+    oracleCid = env.oracleCid
+  newOracleCid <- submit env.admin $ exerciseCmd env.oracleCid PriceOracle_UpdatePrice with
+    newPrice = 1500.0
+  bobStablecoin <- fundStablecoin env env.bob 12000.0
+  result <- submitMulti [env.admin, env.bob] [] $ exerciseCmd vaultCid2 Vault_Liquidate with
+    liquidator = env.bob
+    stablecoinHoldingCids = [bobStablecoin]
+    oracleCid = newOracleCid
+
+  liquidatorHolding <- fetchHolding env.bob result.liquidatorCollateralCid
+  assertBasicFor "liquidator collateral output" env.bob
+    (cip112LiquidationOutputAccount liquidatorHolding.owner)
+  assertMsg "liquidation still returns owner collateral in this scenario"
+    (isSome result.ownerCollateralCid)
+  case result.ownerCollateralCid of
+    None -> fail "expected owner collateral output"
+    Some ownerCollateralCid -> do
+      ownerHolding <- fetchHolding env.alice ownerCollateralCid
+      assertBasicFor "owner liquidation remainder" env.alice
+        (cip112LiquidationOutputAccount ownerHolding.owner)
+
+  assertMsg cip112LiquidationBatchSettlementBlocker
+    cip112LiquidationBatchSettlementSupported
+
+test_cip112LiquidationOverpaymentChangeAndStaleVault : Script ()
+test_cip112LiquidationOverpaymentChangeAndStaleVault = do
+  env <- setupCdpTestEnv
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $ exerciseCmd vaultCid Vault_MintStablecoin with
+    mintAmount = 12000.0
+    oracleCid = env.oracleCid
+  newOracleCid <- submit env.admin $ exerciseCmd env.oracleCid PriceOracle_UpdatePrice with
+    newPrice = 1500.0
+  bobStablecoin <- fundStablecoin env env.bob 13000.0
+  result <- submitMulti [env.admin, env.bob] [] $ exerciseCmd vaultCid2 Vault_Liquidate with
+    liquidator = env.bob
+    stablecoinHoldingCids = [bobStablecoin]
+    oracleCid = newOracleCid
+
+  case result.liquidatorChangeCid of
+    None -> fail "expected liquidator stablecoin change"
+    Some changeCid -> do
+      change <- fetchHolding env.bob changeCid
+      assertMsg "liquidator change should be stablecoin"
+        (change.instrumentId == env.stablecoinInstrumentId)
+      assertMsg "liquidator change should equal overpayment"
+        (change.amount == 1000.0)
+      assertBasicFor "liquidation overpayment change" env.bob
+        (cip112LiquidationOutputAccount change.owner)
+
+  consumedVault <- queryContractId env.alice vaultCid2
+  assertMsg "liquidation should consume the vault"
+    (isNone consumedVault)
+  submitMultiMustFail [env.admin, env.bob] [] $ exerciseCmd vaultCid2 Vault_Liquidate with
+    liquidator = env.bob
+    stablecoinHoldingCids = [toInterfaceContractId @Holding result.liquidatorCollateralCid]
+    oracleCid = newOracleCid

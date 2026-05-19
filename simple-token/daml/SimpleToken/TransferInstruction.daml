@@ -4,10 +4,29 @@ module SimpleToken.TransferInstruction where
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
 import Splice.Api.Token.TransferInstructionV1
+import Splice.Api.Token.TransferInstructionV2 qualified as TransferV2
+import Splice.Api.Token.TransferEventsV2 qualified as TransferEventsV2
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import DA.Map qualified as Map
 
 import SimpleToken.Holding
 import SimpleToken.ContextUtils
+
+-- | Experimental V2 actor guard markers used before delegating into V1 choices.
+v2TransferAcceptActorFailureMsg : Text
+v2TransferAcceptActorFailureMsg =
+  "SimpleToken V2 TransferInstruction_Accept: actors must equal the receiver owner before V1 delegation"
+
+v2TransferRejectActorFailureMsg : Text
+v2TransferRejectActorFailureMsg =
+  "SimpleToken V2 TransferInstruction_Reject: actors must equal the receiver owner before V1 delegation"
+
+v2TransferWithdrawActorFailureMsg : Text
+v2TransferWithdrawActorFailureMsg =
+  "SimpleToken V2 TransferInstruction_Withdraw: actors must equal the sender owner before V1 delegation"
 
 -- | A pending transfer instruction backed by a locked holding.
 template SimpleTransferInstruction
@@ -67,6 +86,65 @@ template SimpleTransferInstruction
 
       transferInstruction_updateImpl _selfCid _arg = do
         fail "TransferInstruction_Update is not supported"
+
+    interface instance TransferV2.TransferInstruction for SimpleTransferInstruction where
+      view = TransferV2.TransferInstructionView with
+        originalInstructionCid = TokenStandard.upcast <$> originalInstructionCid
+        transfer = TokenStandard.upcast transfer
+        expiresAt = Some transfer.executeBefore
+        availableActions = v2PendingTransferActions transfer.sender transfer.receiver
+        meta = emptyMetadata
+
+      transferInstruction_acceptExtraObservers =
+        TokenStandard.transferInstruction_acceptDefaultExtraObservers this
+      transferInstruction_rejectExtraObservers =
+        TokenStandard.transferInstruction_rejectDefaultExtraObservers this
+      transferInstruction_withdrawExtraObservers =
+        TokenStandard.transferInstruction_withdrawDefaultExtraObservers this
+
+      transferInstruction_acceptImpl selfCid arg = do
+        assertMsg v2TransferAcceptActorFailureMsg (arg.actors == [transfer.receiver])
+        result <- TokenStandard.transferInstruction_v2_receiverActor_acceptDefaultImplUsingV1
+          transfer.receiver selfCid arg
+        contextEventLogCid <- lookupFromContextU @(ContractId TransferEventsV2.EventLog)
+          arg.extraArgs.context
+          eventLogContextKey
+        case (contextEventLogCid, result.output) of
+          (Some logCid, TransferV2.TransferInstructionResult_Completed receiverHoldingCids) ->
+            TokenStandard.logTransfer
+              logCid
+              (v2TransferForAcceptEvent transfer lockedHoldingCid)
+              result.senderChangeCids
+              receiverHoldingCids
+          _ -> pure ()
+        pure result
+
+      transferInstruction_rejectImpl selfCid arg = do
+        assertMsg v2TransferRejectActorFailureMsg (arg.actors == [transfer.receiver])
+        TokenStandard.transferInstruction_v2_receiverActor_rejectDefaultImplUsingV1
+          transfer.receiver selfCid arg
+
+      transferInstruction_withdrawImpl selfCid arg = do
+        assertMsg v2TransferWithdrawActorFailureMsg (arg.actors == [transfer.sender])
+        TokenStandard.transferInstruction_v2_senderActor_withdrawDefaultImplUsingV1
+          transfer.sender selfCid arg
+
+
+-- | Experimental CIP-0112 V2 action map for providerless basic accounts only.
+v2PendingTransferActions : Party -> Party -> Map.Map TransferV2.TransferInstructionAction [[Party]]
+v2PendingTransferActions sender receiver = Map.fromList
+  [ (TransferV2.TIA_Withdraw, [[sender]])
+  , (TransferV2.TIA_Accept, [[receiver]])
+  , (TransferV2.TIA_Reject, [[receiver]])
+  ]
+
+v2TransferForAcceptEvent
+  : Transfer
+  -> ContractId LockedSimpleHolding
+  -> TransferV2.Transfer
+v2TransferForAcceptEvent transfer lockedHoldingCid =
+  (TokenStandard.upcast transfer) with
+    inputHoldingCids = [toInterfaceContractId @HoldingV2.Holding lockedHoldingCid]
 
 
 -- | Helper: archive locked holding and return unlocked holding to sender.

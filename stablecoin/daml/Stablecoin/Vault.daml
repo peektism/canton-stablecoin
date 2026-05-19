@@ -5,10 +5,16 @@
 module Stablecoin.Vault where
 
 import DA.Action (when)
+import DA.TextMap (TextMap)
+import DA.TextMap qualified as TextMap
 import DA.Time (subTime, convertRelTimeToMicroseconds)
 
 import Splice.Api.Token.MetadataV1
 import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
+import Splice.TokenStandard.Utils qualified as TokenStandard
 
 import SimpleToken.Holding (SimpleHolding(..))
 import Stablecoin.Oracle (PriceOracle)
@@ -28,6 +34,30 @@ data VaultLiquidationResult = VaultLiquidationResult
     liquidatorCollateralCid : ContractId SimpleHolding
     liquidatorChangeCid : Optional (ContractId SimpleHolding)
     ownerCollateralCid : Optional (ContractId SimpleHolding)
+    badDebt : Decimal
+  deriving (Show, Eq)
+
+data Cip112SettlementConfig = Cip112SettlementConfig
+  with
+    allocationFactoryCid : ContractId AllocationInstructionV2.AllocationFactory
+    settlementFactoryCid : ContractId AllocationV2.SettlementFactory
+    executor : Party
+    settlementRefId : Text
+    settlementDeadline : Optional Time
+  deriving (Show, Eq)
+
+data VaultCip112CloseResult = VaultCip112CloseResult
+  with
+    collateralCid : ContractId SimpleHolding
+    repaymentChangeCids : TextMap [ContractId HoldingV2.Holding]
+    settlementResult : AllocationV2.SettlementFactory_SettleBatchResult
+  deriving (Show, Eq)
+
+data VaultCip112LiquidationResult = VaultCip112LiquidationResult
+  with
+    ownerCollateralCid : Optional (ContractId SimpleHolding)
+    liquidatorStablecoinChangeCids : TextMap [ContractId HoldingV2.Holding]
+    settlementResult : AllocationV2.SettlementFactory_SettleBatchResult
     badDebt : Decimal
   deriving (Show, Eq)
 
@@ -291,6 +321,226 @@ template Vault
             ownerCollateralCid
             badDebt = 0.0
 
+    -- | Experimental non-release CIP-0112 close path. It creates the V2
+    -- allocations needed to burn the repayment, settles them through the live
+    -- SettlementFactory, then returns the collateral. Existing V1 close remains
+    -- the stable behavior.
+    choice Vault_Cip112CloseWithSettlement : VaultCip112CloseResult
+      with
+        settlementConfig : Cip112SettlementConfig
+        stablecoinHoldingCids : [ContractId Holding]
+      controller owner
+      do
+        assertMsg "CIP-112 close requires admin as settlement executor"
+          (settlementConfig.executor == admin)
+        now <- getTime
+        let accruedDebt = accrueDebt debtAmount lastAccrualTime now params.stabilityFeeRate
+        assertMsg "CIP-112 close requires positive debt"
+          (accruedDebt > 0.0)
+        assertMsg "stablecoinHoldingCids must not be empty when debt > 0"
+          (not $ null stablecoinHoldingCids)
+        repaymentTotal <- sumInputHoldings admin owner stablecoinInstrumentId stablecoinHoldingCids
+        assertMsg "Must repay full debt to close vault"
+          (repaymentTotal >= accruedDebt)
+
+        let settlement = cip112SettlementInfo settlementConfig
+            debtLeg = cip112TransferLeg
+              "oz.cdp/close/repay-debt"
+              (TokenStandard.basicAccount owner)
+              (TokenStandard.burnAccount admin)
+              stablecoinInstrumentId
+              accruedDebt
+              "close-repay"
+        (repaymentAllocCid, repaymentChangeCids) <- cip112CreateAcceptedAllocation
+          settlementConfig
+          admin
+          settlement
+          (TokenStandard.basicAccount owner)
+          AllocationV2.SenderSide
+          (TokenStandard.burnAccount admin)
+          stablecoinInstrumentId
+          accruedDebt
+          (map TokenStandard.upcast stablecoinHoldingCids)
+          [owner]
+          "oz.cdp/close/repay-debt"
+          "close-repay"
+          "close-repay-sender"
+        (burnAllocCid, _) <- cip112CreateAcceptedAllocation
+          settlementConfig
+          admin
+          settlement
+          (TokenStandard.burnAccount admin)
+          AllocationV2.ReceiverSide
+          (TokenStandard.basicAccount owner)
+          stablecoinInstrumentId
+          accruedDebt
+          []
+          [admin]
+          "oz.cdp/close/repay-debt"
+          "close-repay"
+          "close-repay-burn"
+        settlementResult <- exercise settlementConfig.settlementFactoryCid
+          AllocationV2.SettlementFactory_SettleBatch with
+            settlement
+            transferLegs = [debtLeg]
+            allocations = map TokenStandard.nonIteratedAllocation [repaymentAllocCid, burnAllocCid]
+            actors = [settlementConfig.executor]
+            extraArgs = cip112EmptyExtraArgs
+        collateralCid <- create SimpleHolding with
+          admin
+          owner
+          instrumentId = collateralInstrumentId
+          amount = collateralAmount
+          meta = cip112FlowMeta "close-collateral-return"
+        pure VaultCip112CloseResult with
+          collateralCid
+          repaymentChangeCids
+          settlementResult
+
+    -- | Experimental non-release CIP-0112 liquidation path. The choice
+    -- materializes the seized vault collateral as a temporary owner holding,
+    -- creates the V2 debt-burn and collateral-seizure allocations, settles the
+    -- whole batch live, and returns any owner remainder.
+    choice Vault_Cip112LiquidateWithSettlement : VaultCip112LiquidationResult
+      with
+        liquidator : Party
+        stablecoinHoldingCids : [ContractId Holding]
+        oracleCid : ContractId PriceOracle
+        settlementConfig : Cip112SettlementConfig
+      controller admin, liquidator
+      do
+        assertMsg "CIP-112 liquidation requires admin as settlement executor"
+          (settlementConfig.executor == admin)
+        now <- getTime
+        let accruedDebt = accrueDebt debtAmount lastAccrualTime now params.stabilityFeeRate
+        oracle <- fetch oracleCid
+        assertMsg "Oracle admin mismatch" (oracle.admin == admin)
+        assertMsg "Oracle collateralInstrumentId mismatch"
+          (oracle.collateralInstrumentId == collateralInstrumentId)
+        assertMsg "Oracle price must be positive" (oracle.price > 0.0)
+        assertMsg "Vault is not undercollateralized"
+          (accruedDebt > 0.0
+           && collateralRatio collateralAmount accruedDebt oracle.price < params.liquidationRatio)
+        assertMsg "stablecoinHoldingCids must not be empty"
+          (not $ null stablecoinHoldingCids)
+        liquidatorPayment <- sumInputHoldings admin liquidator stablecoinInstrumentId stablecoinHoldingCids
+        let collateralToSeize = (accruedDebt * (1.0 + params.liquidationBonus)) / oracle.price
+            fullSeizure = collateralToSeize >= collateralAmount
+            actualDebtCovered = if fullSeizure then min liquidatorPayment accruedDebt else accruedDebt
+            seizedCollateral = if fullSeizure then collateralAmount else collateralToSeize
+            remainingCollateral = collateralAmount - seizedCollateral
+        when (not fullSeizure) $
+          assertMsg "Liquidator must provide enough stablecoin to cover debt"
+            (liquidatorPayment >= accruedDebt)
+        assertMsg "Liquidator payment must be positive"
+          (actualDebtCovered > 0.0)
+
+        temporaryCollateralCid <- create SimpleHolding with
+          admin
+          owner
+          instrumentId = collateralInstrumentId
+          amount = seizedCollateral
+          meta = cip112FlowMeta "liquidation-temporary-collateral"
+        let settlement = cip112SettlementInfo settlementConfig
+            debtLeg = cip112TransferLeg
+              "oz.cdp/liquidation/repay-debt"
+              (TokenStandard.basicAccount liquidator)
+              (TokenStandard.burnAccount admin)
+              stablecoinInstrumentId
+              actualDebtCovered
+              "liquidation-repay"
+            collateralLeg = cip112TransferLeg
+              "oz.cdp/liquidation/seize-collateral"
+              (TokenStandard.basicAccount owner)
+              (TokenStandard.basicAccount liquidator)
+              collateralInstrumentId
+              seizedCollateral
+              "liquidation-seize"
+
+        (debtAllocCid, liquidatorStablecoinChangeCids) <- cip112CreateAcceptedAllocation
+          settlementConfig
+          admin
+          settlement
+          (TokenStandard.basicAccount liquidator)
+          AllocationV2.SenderSide
+          (TokenStandard.burnAccount admin)
+          stablecoinInstrumentId
+          actualDebtCovered
+          (map TokenStandard.upcast stablecoinHoldingCids)
+          [liquidator]
+          "oz.cdp/liquidation/repay-debt"
+          "liquidation-repay"
+          "liquidation-debt-sender"
+        (burnAllocCid, _) <- cip112CreateAcceptedAllocation
+          settlementConfig
+          admin
+          settlement
+          (TokenStandard.burnAccount admin)
+          AllocationV2.ReceiverSide
+          (TokenStandard.basicAccount liquidator)
+          stablecoinInstrumentId
+          actualDebtCovered
+          []
+          [admin]
+          "oz.cdp/liquidation/repay-debt"
+          "liquidation-repay"
+          "liquidation-debt-burn"
+        (collateralSenderAllocCid, _) <- cip112CreateAcceptedAllocation
+          settlementConfig
+          admin
+          settlement
+          (TokenStandard.basicAccount owner)
+          AllocationV2.SenderSide
+          (TokenStandard.basicAccount liquidator)
+          collateralInstrumentId
+          seizedCollateral
+          [toInterfaceContractId @HoldingV2.Holding temporaryCollateralCid]
+          [owner]
+          "oz.cdp/liquidation/seize-collateral"
+          "liquidation-seize"
+          "liquidation-collateral-sender"
+        (collateralReceiverAllocCid, _) <- cip112CreateAcceptedAllocation
+          settlementConfig
+          admin
+          settlement
+          (TokenStandard.basicAccount liquidator)
+          AllocationV2.ReceiverSide
+          (TokenStandard.basicAccount owner)
+          collateralInstrumentId
+          seizedCollateral
+          []
+          [liquidator]
+          "oz.cdp/liquidation/seize-collateral"
+          "liquidation-seize"
+          "liquidation-collateral-receiver"
+        settlementResult <- exercise settlementConfig.settlementFactoryCid
+          AllocationV2.SettlementFactory_SettleBatch with
+            settlement
+            transferLegs = [debtLeg, collateralLeg]
+            allocations = map TokenStandard.nonIteratedAllocation
+              [ debtAllocCid
+              , burnAllocCid
+              , collateralSenderAllocCid
+              , collateralReceiverAllocCid
+              ]
+            actors = [settlementConfig.executor]
+            extraArgs = cip112EmptyExtraArgs
+        ownerCollateralCid <- if remainingCollateral > 0.0
+          then do
+            cid <- create SimpleHolding with
+              admin
+              owner
+              instrumentId = collateralInstrumentId
+              amount = remainingCollateral
+              meta = cip112FlowMeta "liquidation-owner-remainder"
+            pure (Some cid)
+          else pure None
+        pure VaultCip112LiquidationResult with
+          ownerCollateralCid
+          liquidatorStablecoinChangeCids
+          settlementResult
+          badDebt = accruedDebt - actualDebtCovered
+
 
 -- Helper functions
 --------------------
@@ -320,6 +570,139 @@ archiveAndSumCollateral expectedAdmin expectedOwner expectedInstrumentId holding
     archive holdingCid
     pure hv.amount
   pure (sum amounts)
+
+-- | Read and validate input holdings without archiving them. The V2 allocation
+-- accept step performs the consuming archival inside the live settlement path.
+sumInputHoldings : Party -> Party -> InstrumentId -> [ContractId Holding] -> Update Decimal
+sumInputHoldings expectedAdmin expectedOwner expectedInstrumentId holdingCids = do
+  amounts <- forA holdingCids $ \holdingCid -> do
+    holdingI <- fetch holdingCid
+    let hv = view holdingI
+    assertMsg "Input holding owner does not match expected owner"
+      (hv.owner == expectedOwner)
+    assertMsg "Input holding instrumentId does not match expected"
+      (hv.instrumentId == expectedInstrumentId)
+    assertMsg "Input holding admin does not match expected"
+      (hv.instrumentId.admin == expectedAdmin)
+    case hv.lock of
+      None -> pure ()
+      Some lock -> do
+        now <- getTime
+        let lockExpired = case lock.expiresAt of
+              None -> False
+              Some t -> now >= t
+        assertMsg "Cannot use holding with unexpired lock"
+          lockExpired
+    pure hv.amount
+  pure (sum amounts)
+
+cip112EmptyExtraArgs : ExtraArgs
+cip112EmptyExtraArgs = ExtraArgs with
+  context = emptyChoiceContext
+  meta = emptyMetadata
+
+cip112SettlementInfo : Cip112SettlementConfig -> AllocationV2.SettlementInfo
+cip112SettlementInfo config = AllocationV2.SettlementInfo with
+  executors = [config.executor]
+  settlementRef = AllocationV2.Reference with
+    id = config.settlementRefId
+    cid = None
+  settlementDeadline = config.settlementDeadline
+  meta = cip112FlowMeta "settlement"
+
+cip112FlowMeta : Text -> Metadata
+cip112FlowMeta flow =
+  Metadata with
+    values = TextMap.fromList
+      [ ("oz.cdp/cip112-flow", flow)
+      , ("oz.cdp/non-conformance", "experimental")
+      ]
+
+cip112TransferLeg
+  : Text
+  -> HoldingV2.Account
+  -> HoldingV2.Account
+  -> InstrumentId
+  -> Decimal
+  -> Text
+  -> AllocationV2.TransferLeg
+cip112TransferLeg transferLegId sender receiver instrumentId amount flow =
+  AllocationV2.TransferLeg with
+    transferLegId
+    sender
+    receiver
+    amount
+    instrumentId = instrumentId.id
+    meta = cip112FlowMeta flow
+
+cip112TransferLegSide
+  : Text
+  -> AllocationV2.TransferSide
+  -> HoldingV2.Account
+  -> InstrumentId
+  -> Decimal
+  -> Text
+  -> AllocationV2.TransferLegSide
+cip112TransferLegSide transferLegId side otherside instrumentId amount flow =
+  AllocationV2.TransferLegSide with
+    transferLegId
+    side
+    otherside
+    amount
+    instrumentId = instrumentId.id
+    meta = cip112FlowMeta flow
+
+cip112CreateAcceptedAllocation
+  : Cip112SettlementConfig
+  -> Party
+  -> AllocationV2.SettlementInfo
+  -> HoldingV2.Account
+  -> AllocationV2.TransferSide
+  -> HoldingV2.Account
+  -> InstrumentId
+  -> Decimal
+  -> [ContractId HoldingV2.Holding]
+  -> [Party]
+  -> Text
+  -> Text
+  -> Text
+  -> Update (ContractId AllocationV2.Allocation, TextMap [ContractId HoldingV2.Holding])
+cip112CreateAcceptedAllocation config admin settlement authorizer side otherside instrumentId amount inputHoldingCids actors transferLegId transferLegFlow flow = do
+  requestedAt <- getTime
+  let allocation = AllocationV2.AllocationSpecification with
+        settlement
+        admin
+        authorizer
+        transferLegSides =
+          [ cip112TransferLegSide
+              transferLegId
+              side
+              otherside
+              instrumentId
+              amount
+              transferLegFlow
+          ]
+        nextIterationFunding = None
+        committed = False
+        meta = cip112FlowMeta flow
+  allocationResult <- exercise config.allocationFactoryCid
+    AllocationInstructionV2.AllocationFactory_Allocate with
+      allocation
+      requestedAt
+      inputHoldingCids
+      extraArgs = cip112EmptyExtraArgs
+      actors
+  instrCid <- case allocationResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Pending cid -> pure cid
+    _ -> fail "Expected CIP-112 allocation factory to create a pending instruction"
+  acceptResult <- exercise instrCid
+    AllocationInstructionV2.AllocationInstruction_Accept with
+      actors
+      extraArgs = cip112EmptyExtraArgs
+  allocCid <- case acceptResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed cid -> pure cid
+    _ -> fail "Expected CIP-112 allocation instruction accept to complete"
+  pure (allocCid, acceptResult.authorizerChangeCids)
 
 -- | Calculate accrued debt with linear stability fee.
 -- newDebt = oldDebt * (1 + rate * elapsedYears)

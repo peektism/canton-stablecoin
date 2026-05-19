@@ -1,0 +1,132 @@
+-- | Experimental CIP-0112 liquidation settlement dependency probe.
+-- This module imports the preview V2 Allocation/Holding DARs to keep the
+-- batch-settlement argument shape compiled beside the live Vault settlement
+-- choices. The live exercise path is implemented in Stablecoin.Vault through
+-- the ported local SimpleTokenRules V2 prototype.
+module Stablecoin.Experimental.Cip112.LiquidationSettlement where
+
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1
+
+import Stablecoin.Experimental.Cip112.AccountPolicy
+
+cip112LiquidationDebtLegId : Text
+cip112LiquidationDebtLegId = "oz.cdp/liquidation/repay-debt"
+
+cip112LiquidationCollateralLegId : Text
+cip112LiquidationCollateralLegId = "oz.cdp/liquidation/seize-collateral"
+
+cip112LiquidationSettlementRefId : Text
+cip112LiquidationSettlementRefId = "oz.cdp/liquidation"
+
+-- | The current slice can construct and exercise real preview V2
+-- settle-batch arguments through the ported local simple-token dependency.
+cip112LiquidationSettleBatchArgsCompile : Bool
+cip112LiquidationSettleBatchArgsCompile = True
+
+cip112LiquidationSettleBatchExerciseSupported : Bool
+cip112LiquidationSettleBatchExerciseSupported = True
+
+cip112LiquidationCancellationSupported : Bool
+cip112LiquidationCancellationSupported = True
+
+cip112LiquidationSettlementDependencyBlocker : Text
+cip112LiquidationSettlementDependencyBlocker =
+  "Stablecoin can exercise preview V2 SettlementFactory_SettleBatch through the ported local simple-token V2 prototype. Remaining blockers are release source-of-record, provider-managed accounts, iterated settlement, receipt allocation automation, and conformance tests."
+
+cip112LiquidationCancellationBlocker : Text
+cip112LiquidationCancellationBlocker =
+  "Stablecoin can cancel and withdraw local V2 allocations in the ported prototype. Release blockers remain for provider-managed accounts, receipt allocation automation, iterated settlement, and source-of-record stabilization."
+
+cip112EmptyExtraArgs : ExtraArgs
+cip112EmptyExtraArgs = ExtraArgs with
+  context = emptyChoiceContext
+  meta = emptyMetadata
+
+cip112V2BasicAccount : Party -> HoldingV2.Account
+cip112V2BasicAccount owner = HoldingV2.Account with
+  owner = Some owner
+  provider = None
+  id = ""
+
+cip112V2BurnAccount : Party -> HoldingV2.Account
+cip112V2BurnAccount _admin = HoldingV2.Account with
+  owner = None
+  provider = None
+  id = cip112BurnAccountId
+
+cip112V2MintAccount : Party -> HoldingV2.Account
+cip112V2MintAccount _admin = HoldingV2.Account with
+  owner = None
+  provider = None
+  id = cip112MintAccountId
+
+-- | Shape of the stablecoin debt repayment leg in a liquidation batch.
+-- The liquidator authorizes stablecoin movement into the CIP-112 burn sink.
+cip112LiquidationDebtLeg
+  : Party
+  -> Party
+  -> InstrumentId
+  -> Decimal
+  -> AllocationV2.TransferLeg
+cip112LiquidationDebtLeg admin liquidator stablecoinInstrumentId debtAmount =
+  AllocationV2.TransferLeg with
+    transferLegId = cip112LiquidationDebtLegId
+    sender = cip112V2BasicAccount liquidator
+    receiver = cip112V2BurnAccount admin
+    amount = debtAmount
+    instrumentId = stablecoinInstrumentId.id
+    meta = emptyMetadata
+
+-- | Shape of the collateral seizure leg in a liquidation batch.
+-- The owner-side authorization is not implemented in this repo yet; today the
+-- V1 Vault signatory/controller model performs the seizure directly.
+cip112LiquidationCollateralLeg
+  : Party
+  -> Party
+  -> InstrumentId
+  -> Decimal
+  -> AllocationV2.TransferLeg
+cip112LiquidationCollateralLeg owner liquidator collateralInstrumentId collateralAmount =
+  AllocationV2.TransferLeg with
+    transferLegId = cip112LiquidationCollateralLegId
+    sender = cip112V2BasicAccount owner
+    receiver = cip112V2BasicAccount liquidator
+    amount = collateralAmount
+    instrumentId = collateralInstrumentId.id
+    meta = emptyMetadata
+
+-- | Real preview V2 choice-argument shape for a CDP liquidation. This helper
+-- intentionally leaves finalized allocations empty because it is only a
+-- reusable argument-shape probe; live Vault choices create the required local
+-- FinalizedAllocation CIDs before exercising settlement.
+cip112LiquidationSettleBatchArgs
+  : Party
+  -> Party
+  -> Party
+  -> Party
+  -> InstrumentId
+  -> InstrumentId
+  -> Decimal
+  -> Decimal
+  -> Time
+  -> AllocationV2.SettlementFactory_SettleBatch
+cip112LiquidationSettleBatchArgs
+    admin owner liquidator executor collateralInstrumentId stablecoinInstrumentId debtAmount collateralAmount deadline =
+  AllocationV2.SettlementFactory_SettleBatch with
+    settlement = AllocationV2.SettlementInfo with
+      executors = [executor]
+      settlementRef = AllocationV2.Reference with
+        id = cip112LiquidationSettlementRefId
+        cid = None
+      settlementDeadline = Some deadline
+      meta = emptyMetadata
+    transferLegs =
+      [ cip112LiquidationDebtLeg admin liquidator stablecoinInstrumentId debtAmount
+      , cip112LiquidationCollateralLeg owner liquidator collateralInstrumentId collateralAmount
+      ]
+    allocations = []
+    actors = [executor]
+    extraArgs = cip112EmptyExtraArgs

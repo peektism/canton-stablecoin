@@ -17,6 +17,9 @@ transferPreapprovalContextKey = "transfer-preapproval"
 expireLockContextKey : Text
 expireLockContextKey = "expire-lock"
 
+eventLogContextKey : Text
+eventLogContextKey = "simple-token/cip-112-event-log"
+
 -- tx-kind metadata (Splice convention for wallet interop)
 txKindMetaKey : Text
 txKindMetaKey = "splice.lfdecentralizedtrust.org/tx-kind"
@@ -61,6 +64,16 @@ getFromContextU context k = either fail pure $ getFromContext context k
 addOptionalAnyValue : ToAnyValue a => Text -> Optional a -> TextMap AnyValue -> TextMap AnyValue
 addOptionalAnyValue _k None m = m
 addOptionalAnyValue k (Some value) m = TextMap.insert k (toAnyValue value) m
+
+-- | Store the experimental CIP-112 transfer-events log in choice context.
+withEventLogContext : ContractId t -> ExtraArgs -> ExtraArgs
+withEventLogContext eventLogCid extraArgs =
+  let updatedContext = ChoiceContext with
+        values = TextMap.insert
+          eventLogContextKey
+          (AV_ContractId (coerceContractId eventLogCid))
+          extraArgs.context.values
+  in extraArgs with context = updatedContext
 
 -- ToAnyValue instances
 ------------------------

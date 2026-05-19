@@ -1,0 +1,115 @@
+-- | Experimental CIP-0112 account-policy probes for the CDP layer.
+-- This module intentionally mirrors only the preview Account shape needed by
+-- local tests. It is not a Token Standard V2 interface implementation.
+module Stablecoin.Experimental.Cip112.AccountPolicy where
+
+-- | Preview-shaped account projection used to document CDP account policy
+-- independently from the real V2 DAR types used by the settlement shape probe.
+data Cip112Account = Cip112Account
+  with
+    owner : Optional Party
+    provider : Optional Party
+    id : Text
+  deriving (Show, Eq)
+
+cip112MintAccountId : Text
+cip112MintAccountId = "cip-112/mint"
+
+cip112BurnAccountId : Text
+cip112BurnAccountId = "cip-112/burn"
+
+cip112VaultCollateralAccountId : Text
+cip112VaultCollateralAccountId = "oz.cdp/vault-collateral"
+
+-- | Account equivalent to a V1 owner Party. This is the default for all CDP
+-- outputs that leave vault control in the current V1 implementation.
+cip112BasicAccount : Party -> Cip112Account
+cip112BasicAccount owner = Cip112Account with
+  owner = Some owner
+  provider = None
+  id = ""
+
+-- | Special mint source account from the current preview utility package:
+-- no owner/provider, principal resolved to the instrument admin.
+cip112MintAccount : Party -> Cip112Account
+cip112MintAccount _admin = Cip112Account with
+  owner = None
+  provider = None
+  id = cip112MintAccountId
+
+-- | Special burn sink account from the current preview utility package:
+-- no owner/provider, principal resolved to the instrument admin.
+cip112BurnAccount : Party -> Cip112Account
+cip112BurnAccount _admin = Cip112Account with
+  owner = None
+  provider = None
+  id = cip112BurnAccountId
+
+-- | Candidate shape for future provider-managed vault collateral. The current
+-- CDP does not use this by default; it exists to make the authority delta
+-- explicit in docs and tests.
+cip112ProviderManagedCollateralCandidate : Party -> Party -> Cip112Account
+cip112ProviderManagedCollateralCandidate admin owner = Cip112Account with
+  owner = Some owner
+  provider = Some admin
+  id = cip112VaultCollateralAccountId
+
+cip112IsBasicAccount : Cip112Account -> Bool
+cip112IsBasicAccount account =
+  case account.owner of
+    None -> False
+    Some _ -> account.provider == None && account.id == ""
+
+cip112UsesProvider : Cip112Account -> Bool
+cip112UsesProvider account =
+  case account.provider of
+    None -> False
+    Some _ -> True
+
+-- | Principal follows the preview utility convention: regular accounts use
+-- the owner, special mint/burn accounts use the instrument admin.
+cip112AccountPrincipal : Party -> Cip112Account -> Party
+cip112AccountPrincipal admin account =
+  case account.owner of
+    Some owner -> owner
+    None -> admin
+
+cip112AccountParties : Party -> Cip112Account -> [Party]
+cip112AccountParties admin account =
+  case account.provider of
+    Some provider ->
+      if provider == principal then [principal] else [principal, provider]
+    None -> [principal]
+  where
+    principal = cip112AccountPrincipal admin account
+
+-- | Current CDP policy: withdrawn holdings remain owner basic accounts.
+cip112WithdrawnHoldingAccount : Party -> Cip112Account
+cip112WithdrawnHoldingAccount = cip112BasicAccount
+
+-- | Current CDP policy: minted stablecoin output remains an owner basic
+-- account; the mint source leg is represented separately by cip112MintAccount.
+cip112MintedHoldingAccount : Party -> Cip112Account
+cip112MintedHoldingAccount = cip112BasicAccount
+
+-- | Current CDP policy: stablecoin burn inputs are owner basic accounts; the
+-- burn sink leg is represented separately by cip112BurnAccount.
+cip112BurnInputAccount : Party -> Cip112Account
+cip112BurnInputAccount = cip112BasicAccount
+
+-- | Current CDP policy: vault collateral is represented by the Vault contract,
+-- not by a live Holding. If projected today, keep the owner's basic account.
+cip112VaultCollateralDefaultAccount : Party -> Cip112Account
+cip112VaultCollateralDefaultAccount = cip112BasicAccount
+
+-- | Current CDP policy: liquidation outputs are ordinary holdings for the
+-- liquidator or owner, so they stay basic-account by default.
+cip112LiquidationOutputAccount : Party -> Cip112Account
+cip112LiquidationOutputAccount = cip112BasicAccount
+
+cip112LiquidationBatchSettlementSupported : Bool
+cip112LiquidationBatchSettlementSupported = True
+
+cip112LiquidationBatchSettlementBlocker : Text
+cip112LiquidationBatchSettlementBlocker =
+  "tools/canton-stablecoin now ports the token-template V2 allocation and SettlementFactory prototype for live experimental CDP close and liquidation settlement. This is non-release, basic-account plus special mint/burn account support only, not CIP-0112 conformance."

@@ -49,7 +49,46 @@ AGENTS.md
 tools/
 
 # Build/package manager artifacts
+.cache/
 node_modules/
 target/
 build/
 *.log
+
+# ginit: local machine files
+Thumbs.db
+._*
+*.swp
+*.swo
+*~
+
+# ginit: environment and secret files
+!.env.example
+
+# ginit: agent local state
+CLAUDE.local.md
+.claude/settings.local.json
+.cursor/
+.aider*
+.windsurf/
+.continue/
+.uno-active.json
+.loop-active.json
+CODEX_*
+.git-stage-rescue-*
+
+# ginit: common dependency and build outputs
+/dist/
+/build/
+/coverage/
+*.tsbuildinfo
+/target/
+/.build/
+/DerivedData/
+xcuserdata/
+*.xcuserstate
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

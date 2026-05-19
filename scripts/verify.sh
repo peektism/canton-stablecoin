@@ -7,6 +7,9 @@ TOOLS_DIR="$PROJECT_DIR/tools"
 SOURCE_DIR="$PROJECT_DIR/simple-token/daml"
 STABLECOIN_SOURCE_DIR="$PROJECT_DIR/stablecoin/daml"
 
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$PROJECT_DIR/.cache}"
+mkdir -p "$XDG_CACHE_HOME"
+
 PASS=0
 FAIL=0
 
@@ -60,7 +63,7 @@ if [ -n "${JAVA_HOME:-}" ]; then
 fi
 
 cd "$PROJECT_DIR/simple-token-test"
-if dpm test 2>&1 | grep -q "ok,"; then
+if dpm test; then
   info "daml-props (simple-token): PASS"
   PASS=$((PASS + 1))
 else
@@ -69,7 +72,7 @@ else
 fi
 
 cd "$PROJECT_DIR/stablecoin-test"
-if dpm test 2>&1 | grep -q "ok,"; then
+if dpm test; then
   info "daml-props (stablecoin): PASS"
   PASS=$((PASS + 1))
 else

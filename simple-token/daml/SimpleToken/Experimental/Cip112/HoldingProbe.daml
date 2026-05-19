@@ -1,0 +1,33 @@
+-- | Experimental CIP-0112 holding-account probe.
+-- Maps the existing V1 owner : Party view into the preview V2 Account shape.
+module SimpleToken.Experimental.Cip112.HoldingProbe where
+
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import SimpleToken.Experimental.Cip112.Account
+
+-- | V2-style projection of a V1 HoldingView.
+-- This is a compile probe only, not a Token Standard V2 interface instance.
+data AccountHoldingProbe = AccountHoldingProbe
+  with
+    account : Account
+    instrumentId : HoldingV2.InstrumentId
+    amount : Decimal
+    lock : Optional HoldingV2.Lock
+    meta : Metadata
+
+-- | Preserve the V1 holding payload while replacing owner with basicAccount.
+accountHoldingFromV1 : HoldingV1.HoldingView -> AccountHoldingProbe
+accountHoldingFromV1 holding =
+  AccountHoldingProbe with
+    account = basicAccount holding.owner
+    instrumentId = TokenStandard.upcast holding.instrumentId
+    amount = holding.amount
+    lock = TokenStandard.upcast <$> holding.lock
+    meta = holding.meta
+
+holdingAccountFromV1 : HoldingV1.HoldingView -> Account
+holdingAccountFromV1 holding = (accountHoldingFromV1 holding).account

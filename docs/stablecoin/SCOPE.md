@@ -116,6 +116,10 @@ After running three open-source verification tools ([daml-lint](https://github.c
 - 22 functional tests: 12 happy path + 9 negative + 1 integration
 - 5 property-based tests (daml-props, 200 random sequences each)
 - 5 formal proofs (daml-verify, Z3 SMT solver)
+- Experimental non-release CIP-0112 probes in maintained `tools/` scope:
+  account-policy projection, live close/liquidation settlement through the
+  local simple-token V2 prototype, provider-managed account rejection, and
+  explicit non-conformance/blocker documentation.
 
 ## 4. Out of Scope
 
@@ -129,6 +133,7 @@ After running three open-source verification tools ([daml-lint](https://github.c
 | DSR / savings rate | Monetary policy, not CDP | Separate deposit template |
 | Off-ledger HTTP API | Deployment concern | Separate service project |
 | CLI tooling | Out of scope | N/A |
+| CIP-0112 conformance/release package | Requires source-of-record, SDK, provider, privacy, receipt, and compatibility decisions | Future accepted M1/M2 work |
 
 ## 5. Differences from MakerDAO
 

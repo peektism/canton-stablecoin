@@ -1,0 +1,94 @@
+-- | Experimental CIP-0112 Account/Holding compile probe.
+module SimpleToken.Test.Cip112Probe where
+
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import SimpleToken.Experimental.Cip112.Account
+import SimpleToken.Experimental.Cip112.HoldingProbe
+import SimpleToken.Holding
+import SimpleToken.Test.Setup
+import SimpleToken.Testing.WalletClient
+
+import Daml.Script
+
+assertBasicHoldingAccount : Party -> HoldingV2.HoldingView -> Script ()
+assertBasicHoldingAccount owner holdingView = do
+  let account = holdingView.account
+  assert (account == basicAccount owner)
+  assert (isBasicAccount account)
+  assert (isValidAccountShape account)
+  assert (account.provider == None)
+  assert (account.id == "")
+  assert (account.owner == Some owner)
+  assert (accountObservers account == [owner])
+
+querySingleV2Holding : Party -> HoldingV2.InstrumentId -> Decimal -> Script HoldingV2.HoldingView
+querySingleV2Holding party instrumentId amount = do
+  holdings <- queryInterface @HoldingV2.Holding party
+  let matching = do
+        (_, Some holdingView) <- holdings
+        guard (holdingView.instrumentId == instrumentId)
+        guard (holdingView.amount == amount)
+        pure holdingView
+  case matching of
+    [holdingView] -> pure holdingView
+    _ -> fail $ "Expected exactly one V2 holding, found " <> show (length matching)
+
+-- | Proves the current V1 owner : Party holding shape maps to a basic Account.
+test_basicAccountHoldingProbe : Script ()
+test_basicAccountHoldingProbe = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+  _ <- fundParty registry alice 42.0
+  [(_, holdingView)] <- listHoldings alice registry.instrumentId
+
+  let probe = accountHoldingFromV1 holdingView
+      account = probe.account
+
+  assert (account == basicAccount alice)
+  assert (isBasicAccount account)
+  assert (isValidAccountShape account)
+  assert (account.provider == None)
+  assert (account.id == "")
+  assert (account.owner == Some alice)
+  assert (accountObservers account == [alice])
+  assert (probe.instrumentId == TokenStandard.upcast registry.instrumentId)
+  assert (probe.amount == 42.0)
+  assert (probe.lock == None)
+
+-- | Proves SimpleHolding exposes a real preview V2 Holding interface view.
+test_simpleHoldingV2AccountProjection : Script ()
+test_simpleHoldingV2AccountProjection = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+  _ <- fundParty registry alice 42.0
+
+  holdingView <- querySingleV2Holding alice (TokenStandard.upcast registry.instrumentId) 42.0
+  assertBasicHoldingAccount alice holdingView
+  assert (holdingView.lock == None)
+
+-- | Proves LockedSimpleHolding exposes the same basic account plus upcast lock.
+test_lockedSimpleHoldingV2AccountProjection : Script ()
+test_lockedSimpleHoldingV2AccountProjection = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      lock = HoldingV1.Lock with
+        holders = [registry.admin]
+        expiresAt = Some futureDeadline
+        expiresAfter = None
+        context = Some "cip-112 holding projection"
+  _ <- submitMulti [registry.admin, alice] [] $ createCmd LockedSimpleHolding with
+    admin = registry.admin
+    owner = alice
+    instrumentId = registry.instrumentId
+    amount = 17.0
+    lock
+    extraObservers = []
+    meta = emptyMetadata
+
+  holdingView <- querySingleV2Holding alice (TokenStandard.upcast registry.instrumentId) 17.0
+  assertBasicHoldingAccount alice holdingView
+  assert (holdingView.lock == Some (TokenStandard.upcast lock))

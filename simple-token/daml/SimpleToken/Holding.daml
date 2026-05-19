@@ -4,7 +4,9 @@
 module SimpleToken.Holding where
 
 import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
 import Splice.Api.Token.MetadataV1
+import Splice.TokenStandard.Utils qualified as TokenStandard
 
 -- | A simple, unlocked holding of a token instrument.
 template SimpleHolding
@@ -22,6 +24,14 @@ template SimpleHolding
       view = HoldingView with
         owner
         instrumentId
+        amount
+        lock = None
+        meta
+
+    interface instance HoldingV2.Holding for SimpleHolding where
+      view = HoldingV2.HoldingView with
+        account = TokenStandard.basicAccount owner
+        instrumentId = TokenStandard.upcast instrumentId
         amount
         lock = None
         meta
@@ -59,4 +69,12 @@ template LockedSimpleHolding
         instrumentId
         amount
         lock = Some lock
+        meta
+
+    interface instance HoldingV2.Holding for LockedSimpleHolding where
+      view = HoldingV2.HoldingView with
+        account = TokenStandard.basicAccount owner
+        instrumentId = TokenStandard.upcast instrumentId
+        amount
+        lock = Some (TokenStandard.upcast lock)
         meta

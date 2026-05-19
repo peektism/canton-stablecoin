@@ -1,0 +1,78 @@
+-- | Focused compile/test probe for the stablecoin V2 settlement dependency.
+-- This uses real preview V2 Allocation/Holding types and records that the
+-- local prototype now has a live SettlementFactory exercise path.
+module Stablecoin.Test.Cip112SettlementDependency where
+
+import DA.Time
+
+import Daml.Script
+
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+
+import Stablecoin.Experimental.Cip112.AccountPolicy
+import Stablecoin.Experimental.Cip112.LiquidationSettlement
+import Stablecoin.Test.Cdp
+
+test_cip112LiquidationSettleBatchArgsCompile : Script ()
+test_cip112LiquidationSettleBatchArgsCompile = do
+  env <- setupCdpTestEnv
+  let deadline = addRelTime demoTime (hours 1)
+      batch = cip112LiquidationSettleBatchArgs
+        env.admin
+        env.alice
+        env.bob
+        env.admin
+        env.collateralInstrumentId
+        env.stablecoinInstrumentId
+        12000.0
+        9.04
+        deadline
+  assertMsg "stablecoin should compile real preview V2 settle-batch arguments"
+    cip112LiquidationSettleBatchArgsCompile
+  assertMsg "settlement executor should be the admin keeper for this probe"
+    (batch.settlement.executors == [env.admin])
+  assertMsg "settlement actors should match executors"
+    (batch.actors == [env.admin])
+  assertMsg "shape probe intentionally has no finalized V2 allocations"
+    (batch.allocations == [])
+  case batch.transferLegs of
+    [debtLeg, collateralLeg] -> do
+      assertMsg "debt leg id"
+        (debtLeg.transferLegId == cip112LiquidationDebtLegId)
+      assertMsg "debt leg burns liquidator stablecoin"
+        (debtLeg.sender == cip112V2BasicAccount env.bob
+          && debtLeg.receiver == cip112V2BurnAccount env.admin
+          && debtLeg.instrumentId == env.stablecoinInstrumentId.id
+          && debtLeg.amount == 12000.0)
+      assertMsg "collateral leg sends owner collateral to liquidator"
+        (collateralLeg.sender == cip112V2BasicAccount env.alice
+          && collateralLeg.receiver == cip112V2BasicAccount env.bob
+          && collateralLeg.instrumentId == env.collateralInstrumentId.id
+          && collateralLeg.amount == 9.04)
+    _ -> fail "expected two liquidation transfer legs"
+
+test_cip112LiquidationSettleBatchExercisePathIsLive : Script ()
+test_cip112LiquidationSettleBatchExercisePathIsLive = do
+  env <- setupCdpTestEnv
+  let batch = cip112LiquidationSettleBatchArgs
+        env.admin
+        env.alice
+        env.bob
+        env.admin
+        env.collateralInstrumentId
+        env.stablecoinInstrumentId
+        12000.0
+        9.04
+        (addRelTime demoTime (hours 1))
+      expectedBurnAccount = HoldingV2.Account with
+        owner = None
+        provider = None
+        id = cip112BurnAccountId
+  assertMsg cip112LiquidationSettlementDependencyBlocker
+    cip112LiquidationSettleBatchExerciseSupported
+  assertMsg cip112LiquidationCancellationBlocker
+    cip112LiquidationCancellationSupported
+  assertMsg "burn account remains a special admin account"
+    (cip112V2BurnAccount env.admin == expectedBurnAccount)
+  assertMsg "blocked proof still carries real preview V2 transfer legs"
+    (not (null batch.transferLegs))

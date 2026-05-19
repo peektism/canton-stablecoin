@@ -15,6 +15,30 @@ Three open-source verification tools and manual code review by the author were u
 | Formal properties proved | 9/9 |
 | Property-based tests passed | 5/5 (200 random sequences each) |
 
+## 2026-05-19 Closeout Addendum
+
+The original report above remains the V1 simple-token audit baseline. The
+stablecoin live V2 settlement prototype adds a local experimental dependency on
+the simple-token V2 allocation, settlement, event, and account guard code. That
+prototype is non-release and non-conformant.
+
+Current local verification evidence:
+
+| Check | Result |
+|---|---|
+| DPM package baseline | `dpm --version` reported `1.0.10`; `dpm version --active` reported `3.4.11`; all four stablecoin repo packages declare `sdk-version: 3.4.11` and target LF `2.1`. |
+| `scripts/verify.sh` availability | The script found DPM and ran `simple-token-test` and `stablecoin-test`. It did not find `daml-lint` on `PATH` or at `tools/canton-stablecoin/tools/daml-lint/target/release/daml-lint`; it did not find `tools/canton-stablecoin/tools/daml-verify/.venv/bin/python`. |
+| `scripts/verify.sh` result | Passed with `2 passed, 0 failed`; optional `daml-lint` and `daml-verify` were skipped by the script. |
+| Manual workspace-root `daml-lint` | `tools/daml-lint/target/debug/daml-lint tools/canton-stablecoin/simple-token/daml --format markdown` was available and returned 4 medium `unbounded-fields` findings: `SimpleAllocationInstructionV2.inputHoldingCids`, `SimpleAllocationRequest.senders`, `LockedSimpleHolding.extraObservers`, and `SimpleTokenRules.supportedInstruments`. |
+| Manual workspace-root `daml-verify` | `tools/daml-verify/.venv/bin/python main.py` in `tools/daml-verify` proved 14/14 properties. |
+
+The new `SimpleAllocationInstructionV2.inputHoldingCids` unbounded-list finding
+is acknowledged for the experimental V2 dependency: instruction creation is
+gated by the factory and authorizer, and release work must either bound the
+field or carry an accepted rationale. The existing V1 unbounded-list findings
+remain as previously acknowledged. No release readiness, public package pin, or
+CIP-112 conformance claim follows from this addendum.
+
 ---
 
 ## Tools Used

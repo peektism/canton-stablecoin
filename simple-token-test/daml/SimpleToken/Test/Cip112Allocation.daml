@@ -1,0 +1,819 @@
+-- | Experimental CIP-0112 AllocationInstruction/Allocation compile probes.
+module SimpleToken.Test.Cip112Allocation where
+
+import DA.Map qualified as Map
+import DA.Date
+import DA.Text qualified as Text
+import DA.TextMap qualified as TextMap
+import DA.Time
+
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.TransferInstructionV1
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import SimpleToken.Allocation
+  ( SimpleAllocationInstructionV2
+  , SimpleAllocationV2
+  , v2AllocationCancelActorFailureMsg
+  , v2AllocationInstructionAcceptActorFailureMsg
+  , v2AllocationSettleIteratedUnsupportedFailureMsg
+  )
+import SimpleToken.Rules
+  ( SimpleTokenRules
+  , v2AllocationFactoryActorFailureMsg
+  , v2SettlementFactoryActorFailureMsg
+  , v2SettlementFactoryBasicAccountFailureMsg
+  )
+import SimpleToken.Test.Setup
+import SimpleToken.Testing.SimpleRegistry
+import SimpleToken.Testing.WalletClient
+
+import Daml.Script
+
+mkV2AllocationArgsForSide
+  : SimpleRegistry
+  -> Party
+  -> Party
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV1.Holding]
+  -> Bool
+  -> AllocationInstructionV2.AllocationFactory_Allocate
+mkV2AllocationArgsForSide registry authorizer otherSide executor side amount inputCids committed =
+  AllocationInstructionV2.AllocationFactory_Allocate with
+    allocation = AllocationV2.AllocationSpecification with
+      settlement = AllocationV2.SettlementInfo with
+        executors = [executor]
+        settlementRef = AllocationV2.Reference with id = "cip-112-allocation-test"; cid = None
+        settlementDeadline = Some futureDeadline
+        meta = emptyMetadata
+      admin = registry.admin
+      authorizer = TokenStandard.basicAccount authorizer
+      transferLegSides =
+        [ AllocationV2.TransferLegSide with
+            transferLegId = "leg-1"
+            side
+            otherside = TokenStandard.basicAccount otherSide
+            amount
+            instrumentId = registry.instrumentId.id
+            meta = emptyMetadata
+        ]
+      nextIterationFunding = None
+      committed
+      meta = emptyMetadata
+    requestedAt = demoTime
+    inputHoldingCids = map TokenStandard.upcast inputCids
+    extraArgs = emptyExtraArgs
+    actors = [authorizer]
+
+mkV2AllocationArgsForSideWithNextIteration
+  : SimpleRegistry
+  -> Party
+  -> Party
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV1.Holding]
+  -> Bool
+  -> AllocationInstructionV2.AllocationFactory_Allocate
+mkV2AllocationArgsForSideWithNextIteration registry authorizer otherSide executor side amount inputCids committed =
+  let
+    base = mkV2AllocationArgsForSide registry authorizer otherSide executor side amount inputCids committed
+    allocation = base.allocation with nextIterationFunding = Some TextMap.empty
+  in base with allocation = allocation
+
+mkV2AllocationArgs
+  : SimpleRegistry
+  -> Party
+  -> Party
+  -> Party
+  -> Decimal
+  -> [ContractId HoldingV1.Holding]
+  -> Bool
+  -> AllocationInstructionV2.AllocationFactory_Allocate
+mkV2AllocationArgs registry authorizer receiver executor amount inputCids committed =
+  mkV2AllocationArgsForSide registry authorizer receiver executor AllocationV2.SenderSide amount inputCids committed
+
+mkV2TransferLeg
+  : SimpleRegistry
+  -> Party
+  -> Party
+  -> Decimal
+  -> AllocationV2.TransferLeg
+mkV2TransferLeg registry sender receiver amount =
+  AllocationV2.TransferLeg with
+    transferLegId = "leg-1"
+    sender = TokenStandard.basicAccount sender
+    receiver = TokenStandard.basicAccount receiver
+    amount
+    instrumentId = registry.instrumentId.id
+    meta = emptyMetadata
+
+mkV1SelfTransfer
+  : SimpleRegistry
+  -> Party
+  -> Decimal
+  -> [ContractId HoldingV1.Holding]
+  -> Transfer
+mkV1SelfTransfer registry owner amount inputCids =
+  Transfer with
+    sender = owner
+    receiver = owner
+    amount
+    instrumentId = registry.instrumentId
+    requestedAt = demoTime
+    executeBefore = futureDeadline
+    inputHoldingCids = inputCids
+    meta = emptyMetadata
+
+getV2AllocationFactory
+  : SimpleRegistry
+  -> Script (ContractId AllocationInstructionV2.AllocationFactory, Disclosures)
+getV2AllocationFactory registry = do
+  [(rulesCid, _)] <- query @SimpleTokenRules registry.admin
+  rulesDisc <- queryDisc @SimpleTokenRules registry.admin rulesCid
+  pure (toInterfaceContractId @AllocationInstructionV2.AllocationFactory rulesCid, rulesDisc)
+
+getV2SettlementFactory
+  : SimpleRegistry
+  -> Script (ContractId AllocationV2.SettlementFactory, Disclosures)
+getV2SettlementFactory registry = do
+  [(rulesCid, _)] <- query @SimpleTokenRules registry.admin
+  rulesDisc <- queryDisc @SimpleTokenRules registry.admin rulesCid
+  pure (toInterfaceContractId @AllocationV2.SettlementFactory rulesCid, rulesDisc)
+
+exerciseV2AllocationFactory
+  : ContractId AllocationInstructionV2.AllocationFactory
+  -> AllocationInstructionV2.AllocationFactory_Allocate
+  -> Commands AllocationInstructionV2.AllocationInstructionResult
+exerciseV2AllocationFactory afCid args =
+  exerciseCmd afCid AllocationInstructionV2.AllocationFactory_Allocate with
+    allocation = args.allocation
+    requestedAt = args.requestedAt
+    inputHoldingCids = args.inputHoldingCids
+    extraArgs = args.extraArgs
+    actors = args.actors
+
+exerciseV2SettlementFactory
+  : ContractId AllocationV2.SettlementFactory
+  -> AllocationV2.SettlementInfo
+  -> [AllocationV2.TransferLeg]
+  -> [ContractId AllocationV2.Allocation]
+  -> [Party]
+  -> Commands AllocationV2.SettlementFactory_SettleBatchResult
+exerciseV2SettlementFactory sfCid settlement transferLegs allocationCids actors =
+  exerciseCmd sfCid AllocationV2.SettlementFactory_SettleBatch with
+    settlement
+    transferLegs
+    allocations = map TokenStandard.nonIteratedAllocation allocationCids
+    actors
+    extraArgs = emptyExtraArgs
+
+exerciseV2SettlementFactoryWithFinalized
+  : ContractId AllocationV2.SettlementFactory
+  -> AllocationV2.SettlementInfo
+  -> [AllocationV2.TransferLeg]
+  -> [AllocationV2.FinalizedAllocation]
+  -> [Party]
+  -> Commands AllocationV2.SettlementFactory_SettleBatchResult
+exerciseV2SettlementFactoryWithFinalized sfCid settlement transferLegs allocations actors =
+  exerciseCmd sfCid AllocationV2.SettlementFactory_SettleBatch with
+    settlement
+    transferLegs
+    allocations
+    actors
+    extraArgs = emptyExtraArgs
+
+queryV2AllocationInstructionDisc
+  : Party
+  -> ContractId AllocationInstructionV2.AllocationInstruction
+  -> Script Disclosures
+queryV2AllocationInstructionDisc observer instrCid =
+  queryDisc @SimpleAllocationInstructionV2 observer (coerceContractId instrCid)
+
+queryV2AllocationDisc : Party -> ContractId AllocationV2.Allocation -> Script Disclosures
+queryV2AllocationDisc observer allocCid =
+  queryDisc @SimpleAllocationV2 observer (coerceContractId allocCid)
+
+submitWithDiscError : Party -> Disclosures -> Commands a -> Script SubmitError
+submitWithDiscError p (Disclosures ds) cmds =
+  submitWithError (actAs p <> discloseMany ds) cmds
+
+assertSubmitErrorContains : Text -> SubmitError -> Script ()
+assertSubmitErrorContains expected err =
+  assertMsg
+    ("Expected submit error to contain " <> show expected <> ", got: " <> show err)
+    (expected `Text.isInfixOf` show err)
+
+createPendingV2AllocationInstruction
+  : SimpleRegistry
+  -> Party
+  -> Party
+  -> Party
+  -> Decimal
+  -> [ContractId HoldingV1.Holding]
+  -> Bool
+  -> Script (ContractId AllocationInstructionV2.AllocationInstruction)
+createPendingV2AllocationInstruction registry authorizer receiver executor amount inputCids committed = do
+  createPendingV2AllocationInstructionForSide
+    registry authorizer receiver executor AllocationV2.SenderSide amount inputCids committed
+
+createPendingV2AllocationInstructionForSide
+  : SimpleRegistry
+  -> Party
+  -> Party
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV1.Holding]
+  -> Bool
+  -> Script (ContractId AllocationInstructionV2.AllocationInstruction)
+createPendingV2AllocationInstructionForSide registry authorizer otherSide executor side amount inputCids committed = do
+  (afCid, rulesDisc) <- getV2AllocationFactory registry
+  result <- submitWithDisc authorizer rulesDisc $
+    exerciseV2AllocationFactory afCid
+      (mkV2AllocationArgsForSide registry authorizer otherSide executor side amount inputCids committed)
+  case result.output of
+    AllocationInstructionV2.AllocationInstructionResult_Pending instrCid -> pure instrCid
+    _ -> fail "Expected V2 allocation factory to create a pending instruction"
+
+createAcceptedV2AllocationForSide
+  : SimpleRegistry
+  -> Party
+  -> Party
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV1.Holding]
+  -> Bool
+  -> Script (ContractId AllocationV2.Allocation)
+createAcceptedV2AllocationForSide registry authorizer otherSide executor side amount inputCids committed = do
+  instrCid <- createPendingV2AllocationInstructionForSide
+    registry authorizer otherSide executor side amount inputCids committed
+  acceptResult <- acceptV2AllocationInstruction authorizer instrCid
+  case acceptResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> pure allocCid
+    _ -> fail "Expected V2 allocation instruction accept to complete"
+
+createAcceptedV2AllocationForSideWithNextIteration
+  : SimpleRegistry
+  -> Party
+  -> Party
+  -> Party
+  -> AllocationV2.TransferSide
+  -> Decimal
+  -> [ContractId HoldingV1.Holding]
+  -> Bool
+  -> Script (ContractId AllocationV2.Allocation)
+createAcceptedV2AllocationForSideWithNextIteration registry authorizer otherSide executor side amount inputCids committed = do
+  (afCid, rulesDisc) <- getV2AllocationFactory registry
+  result <- submitWithDisc authorizer rulesDisc $
+    exerciseV2AllocationFactory afCid
+      (mkV2AllocationArgsForSideWithNextIteration registry authorizer otherSide executor side amount inputCids committed)
+  instrCid <- case result.output of
+    AllocationInstructionV2.AllocationInstructionResult_Pending cid -> pure cid
+    _ -> fail "Expected V2 allocation factory to create a pending instruction"
+  acceptResult <- acceptV2AllocationInstruction authorizer instrCid
+  case acceptResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> pure allocCid
+    _ -> fail "Expected V2 allocation instruction accept to complete"
+
+iteratedFinalizedAllocation
+  : ContractId AllocationV2.Allocation
+  -> AllocationV2.FinalizedAllocation
+iteratedFinalizedAllocation allocCid =
+  (TokenStandard.nonIteratedAllocation allocCid) with
+    nextIterationFunding = Some TextMap.empty
+
+acceptV2AllocationInstruction
+  : Party
+  -> ContractId AllocationInstructionV2.AllocationInstruction
+  -> Script AllocationInstructionV2.AllocationInstructionResult
+acceptV2AllocationInstruction authorizer instrCid =
+  submit authorizer $
+    exerciseCmd instrCid AllocationInstructionV2.AllocationInstruction_Accept with
+      actors = [authorizer]
+      extraArgs = emptyExtraArgs
+
+querySingleV2AllocationInstruction
+  : Party
+  -> ContractId AllocationInstructionV2.AllocationInstruction
+  -> Script AllocationInstructionV2.AllocationInstructionView
+querySingleV2AllocationInstruction observer instrCid = do
+  instructions <- queryInterface @AllocationInstructionV2.AllocationInstruction observer
+  let matches = do
+        (cid, Some instrView) <- instructions
+        guard (cid == instrCid)
+        pure instrView
+  case matches of
+    [instrView] -> pure instrView
+    _ -> fail $ "Expected exactly one V2 allocation instruction, found " <> show (length matches)
+
+querySingleV2Allocation
+  : Party
+  -> ContractId AllocationV2.Allocation
+  -> Script AllocationV2.AllocationView
+querySingleV2Allocation observer allocCid = do
+  allocations <- queryInterface @AllocationV2.Allocation observer
+  let matches = do
+        (cid, Some allocView) <- allocations
+        guard (cid == allocCid)
+        pure allocView
+  case matches of
+    [allocView] -> pure allocView
+    _ -> fail $ "Expected exactly one V2 allocation, found " <> show (length matches)
+
+assertNoV2AllocationInstruction
+  : Party
+  -> ContractId AllocationInstructionV2.AllocationInstruction
+  -> Script ()
+assertNoV2AllocationInstruction observer instrCid = do
+  instructions <- queryInterface @AllocationInstructionV2.AllocationInstruction observer
+  let matches = do
+        (cid, Some _instrView) <- instructions
+        guard (cid == instrCid)
+        pure cid
+  assert (null matches)
+
+assertNoV2Allocation : Party -> ContractId AllocationV2.Allocation -> Script ()
+assertNoV2Allocation observer allocCid = do
+  allocations <- queryInterface @AllocationV2.Allocation observer
+  let matches = do
+        (cid, Some _allocView) <- allocations
+        guard (cid == allocCid)
+        pure cid
+  assert (null matches)
+
+assertNoLockedHoldings : Party -> HoldingV1.InstrumentId -> Script ()
+assertNoLockedHoldings owner instrumentId = do
+  locked <- listLockedHoldings owner instrumentId
+  assert (null locked)
+
+-- | V2 factory creates an instruction, and accepting it creates a locked allocation.
+test_v2AllocationInstructionAcceptCreatesAllocation : Script ()
+test_v2AllocationInstructionAcceptCreatesAllocation = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+  [h1] <- fundParty registry alice 100.0
+  instrCid <- createPendingV2AllocationInstruction registry alice bob executor 70.0 [h1] False
+
+  instrView <- querySingleV2AllocationInstruction alice instrCid
+  assert (instrView.allocation.authorizer == TokenStandard.basicAccount alice)
+  assert (instrView.availableActions == Map.fromList
+    [ (AllocationInstructionV2.AIA_Accept, [[alice]])
+    , (AllocationInstructionV2.AIA_Withdraw, [[alice]])
+    ])
+  checkBalance alice registry.instrumentId 100.0
+  assertNoLockedHoldings alice registry.instrumentId
+
+  acceptResult <- acceptV2AllocationInstruction alice instrCid
+  case acceptResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> do
+      assertNoV2AllocationInstruction alice instrCid
+      allocView <- querySingleV2Allocation alice allocCid
+      assert (allocView.allocation.authorizer == TokenStandard.basicAccount alice)
+      assert (allocView.availableActions == Map.fromList
+        [ (AllocationV2.AA_Withdraw, [[alice]])
+        , (AllocationV2.AA_Cancel, [[executor]])
+        , (AllocationV2.AA_Settle, [[registry.admin, executor]])
+        ])
+      assert (length allocView.holdingCids == 1)
+      case TextMap.lookup registry.instrumentId.id acceptResult.authorizerChangeCids of
+        Some changeCids -> assert (length changeCids == 1)
+        None -> fail "Expected V2 allocation change holding"
+      locked <- listLockedHoldings alice registry.instrumentId
+      case locked of
+        [(_, lockedView)] -> assert (lockedView.amount == 70.0)
+        _ -> fail $ "Expected exactly one locked holding, found " <> show (length locked)
+    _ -> fail "Expected V2 allocation instruction accept to complete"
+
+-- | V2 SettlementFactory settles matching sender and receiver allocations atomically.
+test_v2SettlementFactorySettleBatchTransfersFunds : Script ()
+test_v2SettlementFactorySettleBatchTransfersFunds = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      amount = 70.0
+      transferLeg = mkV2TransferLeg registry alice bob amount
+      settlement = (mkV2AllocationArgs registry alice bob executor amount [] False).allocation.settlement
+  [h1] <- fundParty registry alice 100.0
+
+  senderAllocCid <- createAcceptedV2AllocationForSide
+    registry alice bob executor AllocationV2.SenderSide amount [h1] False
+  receiverAllocCid <- createAcceptedV2AllocationForSide
+    registry bob alice executor AllocationV2.ReceiverSide amount [] False
+
+  senderView <- querySingleV2Allocation alice senderAllocCid
+  receiverView <- querySingleV2Allocation bob receiverAllocCid
+  assert (Map.lookup AllocationV2.AA_Settle senderView.availableActions == Some [[registry.admin, executor]])
+  assert (Map.lookup AllocationV2.AA_Settle receiverView.availableActions == Some [[registry.admin, executor]])
+
+  (sfCid, rulesDisc) <- getV2SettlementFactory registry
+  settleResult <- submitWithDisc executor rulesDisc $
+    exerciseV2SettlementFactory sfCid settlement [transferLeg] [senderAllocCid, receiverAllocCid] [executor]
+
+  assert (length settleResult.allocationSettleResults == 2)
+  assertNoV2Allocation alice senderAllocCid
+  assertNoV2Allocation bob receiverAllocCid
+  assertNoLockedHoldings alice registry.instrumentId
+  checkBalance alice registry.instrumentId 30.0
+  checkBalance bob registry.instrumentId 70.0
+
+-- | Settlement actors are treated as a party set, so admin/executor overlap is accepted.
+test_v2SettlementFactoryAcceptsAdminExecutorOverlap : Script ()
+test_v2SettlementFactoryAcceptsAdminExecutorOverlap = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = registry.admin
+      amount = 70.0
+      transferLeg = mkV2TransferLeg registry alice bob amount
+      settlement = (mkV2AllocationArgs registry alice bob executor amount [] False).allocation.settlement
+  [h1] <- fundParty registry alice 100.0
+
+  senderAllocCid <- createAcceptedV2AllocationForSide
+    registry alice bob executor AllocationV2.SenderSide amount [h1] False
+  receiverAllocCid <- createAcceptedV2AllocationForSide
+    registry bob alice executor AllocationV2.ReceiverSide amount [] False
+
+  senderView <- querySingleV2Allocation alice senderAllocCid
+  assert (Map.lookup AllocationV2.AA_Settle senderView.availableActions == Some [[registry.admin]])
+
+  (sfCid, rulesDisc) <- getV2SettlementFactory registry
+  settleResult <- submitWithDisc executor rulesDisc $
+    exerciseV2SettlementFactory sfCid settlement [transferLeg] [senderAllocCid, receiverAllocCid] [executor]
+
+  assert (length settleResult.allocationSettleResults == 2)
+  assertNoV2Allocation alice senderAllocCid
+  assertNoV2Allocation bob receiverAllocCid
+  assertNoLockedHoldings alice registry.instrumentId
+  checkBalance alice registry.instrumentId 30.0
+  checkBalance bob registry.instrumentId 70.0
+
+-- | Iterated-settlement arguments are rejected explicitly until this slice supports them.
+test_v2SettlementFactoryRejectsIteratedSettlementArgs : Script ()
+test_v2SettlementFactoryRejectsIteratedSettlementArgs = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      amount = 70.0
+      transferLeg = mkV2TransferLeg registry alice bob amount
+      settlement =
+        (mkV2AllocationArgsForSideWithNextIteration
+          registry alice bob executor AllocationV2.SenderSide amount [] False).allocation.settlement
+  [h1] <- fundParty registry alice 100.0
+
+  senderAllocCid <- createAcceptedV2AllocationForSideWithNextIteration
+    registry alice bob executor AllocationV2.SenderSide amount [h1] False
+  receiverAllocCid <- createAcceptedV2AllocationForSideWithNextIteration
+    registry bob alice executor AllocationV2.ReceiverSide amount [] False
+  (sfCid, rulesDisc) <- getV2SettlementFactory registry
+
+  err <- submitWithDiscError executor rulesDisc $
+    exerciseV2SettlementFactoryWithFinalized
+      sfCid
+      settlement
+      [transferLeg]
+      [ iteratedFinalizedAllocation senderAllocCid
+      , iteratedFinalizedAllocation receiverAllocCid
+      ]
+      [executor]
+
+  assertSubmitErrorContains v2AllocationSettleIteratedUnsupportedFailureMsg err
+  senderView <- querySingleV2Allocation alice senderAllocCid
+  receiverView <- querySingleV2Allocation bob receiverAllocCid
+  assert (length senderView.holdingCids == 1)
+  assert (length receiverView.holdingCids == 0)
+  locked <- listLockedHoldings alice registry.instrumentId
+  assert (length locked == 1)
+  checkBalance alice registry.instrumentId 100.0
+  checkBalance bob registry.instrumentId 0.0
+
+-- | V2 SettlementFactory rejects settlement actors outside the executor set.
+test_v2SettlementFactoryRejectsWrongActor : Script ()
+test_v2SettlementFactoryRejectsWrongActor = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      charlie = parties.charlie
+      amount = 70.0
+      transferLeg = mkV2TransferLeg registry alice bob amount
+      settlement = (mkV2AllocationArgs registry alice bob executor amount [] False).allocation.settlement
+  [h1] <- fundParty registry alice 100.0
+  senderAllocCid <- createAcceptedV2AllocationForSide
+    registry alice bob executor AllocationV2.SenderSide amount [h1] False
+  receiverAllocCid <- createAcceptedV2AllocationForSide
+    registry bob alice executor AllocationV2.ReceiverSide amount [] False
+  (sfCid, rulesDisc) <- getV2SettlementFactory registry
+
+  err <- submitWithDiscError charlie rulesDisc $
+    exerciseV2SettlementFactory sfCid settlement [transferLeg] [senderAllocCid, receiverAllocCid] [charlie]
+  assertSubmitErrorContains v2SettlementFactoryActorFailureMsg err
+  checkBalance alice registry.instrumentId 100.0
+  checkBalance bob registry.instrumentId 0.0
+  locked <- listLockedHoldings alice registry.instrumentId
+  assert (length locked == 1)
+
+-- | V2 SettlementFactory keeps this slice basic-account-only.
+test_v2SettlementFactoryRejectsNonBasicTransferLegAccount : Script ()
+test_v2SettlementFactoryRejectsNonBasicTransferLegAccount = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      amount = 70.0
+      settlement = (mkV2AllocationArgs registry alice bob executor amount [] False).allocation.settlement
+      transferLeg = (mkV2TransferLeg registry alice bob amount) with
+        receiver = HoldingV2.Account with
+          owner = Some bob
+          provider = None
+          id = "non-basic"
+  (sfCid, rulesDisc) <- getV2SettlementFactory registry
+  err <- submitWithDiscError executor rulesDisc $
+    exerciseV2SettlementFactory sfCid settlement [transferLeg] [] [executor]
+  assertSubmitErrorContains v2SettlementFactoryBasicAccountFailureMsg err
+
+-- | Incomplete allocation batches fail before locked funds are consumed.
+test_v2SettlementFactoryRejectsMissingReceiverAllocation : Script ()
+test_v2SettlementFactoryRejectsMissingReceiverAllocation = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      amount = 70.0
+      transferLeg = mkV2TransferLeg registry alice bob amount
+      settlement = (mkV2AllocationArgs registry alice bob executor amount [] False).allocation.settlement
+  [h1] <- fundParty registry alice 100.0
+  senderAllocCid <- createAcceptedV2AllocationForSide
+    registry alice bob executor AllocationV2.SenderSide amount [h1] False
+  (sfCid, rulesDisc) <- getV2SettlementFactory registry
+
+  err <- submitWithDiscError executor rulesDisc $
+    exerciseV2SettlementFactory sfCid settlement [transferLeg] [senderAllocCid] [executor]
+  assertSubmitErrorContains "missing authorizations" err
+  senderView <- querySingleV2Allocation alice senderAllocCid
+  assert (length senderView.holdingCids == 1)
+  locked <- listLockedHoldings alice registry.instrumentId
+  assert (length locked == 1)
+  checkBalance alice registry.instrumentId 100.0
+  checkBalance bob registry.instrumentId 0.0
+
+-- | V2 allocation withdraw releases locked funds and archives the allocation.
+test_v2AllocationWithdrawReturnsFunds : Script ()
+test_v2AllocationWithdrawReturnsFunds = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+  [h1] <- fundParty registry alice 100.0
+  instrCid <- createPendingV2AllocationInstruction registry alice bob executor 100.0 [h1] False
+  acceptResult <- acceptV2AllocationInstruction alice instrCid
+  case acceptResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> do
+      withdrawResult <- submit alice $
+        exerciseCmd allocCid AllocationV2.Allocation_Withdraw with
+          actors = [alice]
+          extraArgs = emptyExtraArgs
+      case withdrawResult.output of
+        AllocationV2.AllocationResult_Withdrawn -> pure ()
+        _ -> fail "Expected V2 allocation withdraw"
+      assertNoV2Allocation alice allocCid
+      assertNoLockedHoldings alice registry.instrumentId
+      checkBalance alice registry.instrumentId 100.0
+    _ -> fail "Expected V2 allocation instruction accept to complete"
+
+-- | V2 allocation cancel is executor-controlled and releases locked funds.
+test_v2AllocationCancelReturnsFunds : Script ()
+test_v2AllocationCancelReturnsFunds = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      charlie = parties.charlie
+  [h1] <- fundParty registry alice 100.0
+  instrCid <- createPendingV2AllocationInstruction registry alice bob executor 100.0 [h1] False
+  acceptResult <- acceptV2AllocationInstruction alice instrCid
+  case acceptResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> do
+      allocDisc <- queryV2AllocationDisc alice allocCid
+      wrongActorErr <- submitWithDiscError charlie allocDisc $
+        exerciseCmd allocCid AllocationV2.Allocation_Cancel with
+          actors = [charlie]
+          extraArgs = emptyExtraArgs
+      assertSubmitErrorContains v2AllocationCancelActorFailureMsg wrongActorErr
+
+      cancelResult <- submit executor $
+        exerciseCmd allocCid AllocationV2.Allocation_Cancel with
+          actors = [executor]
+          extraArgs = emptyExtraArgs
+      case cancelResult.output of
+        AllocationV2.AllocationResult_Cancelled -> pure ()
+        _ -> fail "Expected V2 allocation cancel"
+      assertNoV2Allocation alice allocCid
+      assertNoLockedHoldings alice registry.instrumentId
+      checkBalance alice registry.instrumentId 100.0
+    _ -> fail "Expected V2 allocation instruction accept to complete"
+
+-- | V2 factory rejects actors other than the basic authorizer owner.
+test_v2AllocationFactoryRejectsWrongActor : Script ()
+test_v2AllocationFactoryRejectsWrongActor = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      charlie = parties.charlie
+  [h1] <- fundParty registry alice 100.0
+  (afCid, rulesDisc) <- getV2AllocationFactory registry
+  let args = (mkV2AllocationArgs registry alice bob executor 70.0 [h1] False)
+        with actors = [charlie]
+
+  err <- submitWithDiscError charlie rulesDisc $
+    exerciseV2AllocationFactory afCid args
+  assertSubmitErrorContains v2AllocationFactoryActorFailureMsg err
+  checkBalance alice registry.instrumentId 100.0
+
+-- | Non-basic authorizer and counterparty accounts are outside this slice.
+test_v2AllocationFactoryRejectsNonBasicAccounts : Script ()
+test_v2AllocationFactoryRejectsNonBasicAccounts = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      nonBasicAlice = HoldingV2.Account with owner = Some alice; provider = None; id = "non-basic"
+      nonBasicBob = HoldingV2.Account with owner = Some bob; provider = None; id = "non-basic"
+  [h1] <- fundParty registry alice 100.0
+  [h2] <- fundParty registry alice 100.0
+  (afCid, rulesDisc) <- getV2AllocationFactory registry
+  let baseArgs = mkV2AllocationArgs registry alice bob executor 70.0 [h1] False
+      nonBasicAuthorizerArgs = baseArgs with
+        allocation = baseArgs.allocation with authorizer = nonBasicAlice
+      baseArgs2 = mkV2AllocationArgs registry alice bob executor 70.0 [h2] False
+      [badLeg] = baseArgs2.allocation.transferLegSides
+      nonBasicOtherSideArgs = baseArgs2 with
+        allocation = baseArgs2.allocation with
+          transferLegSides = [badLeg with otherside = nonBasicBob]
+
+  submitWithDiscMustFail alice rulesDisc $
+    exerciseV2AllocationFactory afCid nonBasicAuthorizerArgs
+  submitWithDiscMustFail alice rulesDisc $
+    exerciseV2AllocationFactory afCid nonBasicOtherSideArgs
+  checkBalance alice registry.instrumentId 200.0
+
+-- | Malformed V2 allocation specifications are rejected before an instruction is created.
+test_v2AllocationFactoryRejectsMalformedAllocation : Script ()
+test_v2AllocationFactoryRejectsMalformedAllocation = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+  [h1] <- fundParty registry alice 100.0
+  (afCid, rulesDisc) <- getV2AllocationFactory registry
+  let baseArgs = mkV2AllocationArgs registry alice bob executor 70.0 [h1] False
+      malformedArgs = baseArgs with
+        allocation = baseArgs.allocation with transferLegSides = []
+
+  submitWithDiscMustFail alice rulesDisc $
+    exerciseV2AllocationFactory afCid malformedArgs
+  checkBalance alice registry.instrumentId 100.0
+
+-- | Wrong instruction actors are rejected; withdrawing the instruction archives it without locking funds.
+test_v2AllocationInstructionRejectsWrongActorAndWithdraws : Script ()
+test_v2AllocationInstructionRejectsWrongActorAndWithdraws = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      charlie = parties.charlie
+  [h1] <- fundParty registry alice 100.0
+  instrCid <- createPendingV2AllocationInstruction registry alice bob executor 70.0 [h1] False
+  instrDisc <- queryV2AllocationInstructionDisc alice instrCid
+
+  err <- submitWithDiscError charlie instrDisc $
+    exerciseCmd instrCid AllocationInstructionV2.AllocationInstruction_Accept with
+      actors = [charlie]
+      extraArgs = emptyExtraArgs
+  assertSubmitErrorContains v2AllocationInstructionAcceptActorFailureMsg err
+
+  withdrawResult <- submit alice $
+    exerciseCmd instrCid AllocationInstructionV2.AllocationInstruction_Withdraw with
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+  case withdrawResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Failed -> pure ()
+    _ -> fail "Expected V2 allocation instruction withdraw failure result"
+  case TextMap.lookup registry.instrumentId.id withdrawResult.authorizerChangeCids of
+    Some [returnedCid] -> assert (returnedCid == TokenStandard.upcast h1)
+    Some returnedCids -> fail $
+      "Expected one returned V2 allocation input CID, found " <> show (length returnedCids)
+    None -> fail "Expected pending V2 allocation withdraw to return input CID"
+  assertNoV2AllocationInstruction alice instrCid
+  assertNoLockedHoldings alice registry.instrumentId
+  checkBalance alice registry.instrumentId 100.0
+
+-- | Pending instruction withdraw archives even if an input CID was already consumed elsewhere.
+test_v2AllocationInstructionWithdrawsAfterInputConsumed : Script ()
+test_v2AllocationInstructionWithdrawsAfterInputConsumed = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+  [h1] <- fundParty registry alice 100.0
+  instrCid <- createPendingV2AllocationInstruction registry alice bob executor 70.0 [h1] False
+
+  let staleInputTransfer = mkV1SelfTransfer registry alice 100.0 [h1]
+  enriched <- getTransferFactory registry staleInputTransfer emptyExtraArgs
+  staleInputResult <- submitWithDisc alice enriched.disclosures $
+    exerciseCmd enriched.factoryCid enriched.arg
+  case staleInputResult.output of
+    TransferInstructionResult_Completed _ -> pure ()
+    _ -> fail "Expected self-transfer to consume the allocation input"
+
+  withdrawResult <- submit alice $
+    exerciseCmd instrCid AllocationInstructionV2.AllocationInstruction_Withdraw with
+      actors = [alice]
+      extraArgs = emptyExtraArgs
+  case withdrawResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Failed -> pure ()
+    _ -> fail "Expected V2 allocation instruction withdraw failure result"
+  case TextMap.lookup registry.instrumentId.id withdrawResult.authorizerChangeCids of
+    Some [returnedCid] -> assert (returnedCid == TokenStandard.upcast h1)
+    Some returnedCids -> fail $
+      "Expected one returned stale V2 allocation input CID, found " <> show (length returnedCids)
+    None -> fail "Expected pending V2 allocation withdraw to return stale input CID"
+  assertNoV2AllocationInstruction alice instrCid
+  assertNoLockedHoldings alice registry.instrumentId
+  checkBalance alice registry.instrumentId 100.0
+
+-- | Multi-executor cancel accepts the same executor set in caller-provided order.
+test_v2AllocationCancelAcceptsExecutorSetOrder : Script ()
+test_v2AllocationCancelAcceptsExecutorSetOrder = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+      charlie = parties.charlie
+  [h1] <- fundParty registry alice 100.0
+  (afCid, rulesDisc) <- getV2AllocationFactory registry
+  let baseArgs = mkV2AllocationArgs registry alice bob executor 100.0 [h1] False
+      multiExecutorArgs = baseArgs with
+        allocation = baseArgs.allocation with
+          settlement = baseArgs.allocation.settlement with
+            executors = [executor, charlie]
+
+  result <- submitWithDisc alice rulesDisc $
+    exerciseV2AllocationFactory afCid multiExecutorArgs
+  case result.output of
+    AllocationInstructionV2.AllocationInstructionResult_Pending instrCid -> do
+      acceptResult <- acceptV2AllocationInstruction alice instrCid
+      case acceptResult.output of
+        AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> do
+          cancelResult <- submitMulti [charlie, executor] [] $
+            exerciseCmd allocCid AllocationV2.Allocation_Cancel with
+              actors = [charlie, executor]
+              extraArgs = emptyExtraArgs
+          case cancelResult.output of
+            AllocationV2.AllocationResult_Cancelled -> pure ()
+            _ -> fail "Expected V2 allocation cancel"
+          assertNoV2Allocation alice allocCid
+          assertNoLockedHoldings alice registry.instrumentId
+          checkBalance alice registry.instrumentId 100.0
+        _ -> fail "Expected V2 allocation instruction accept to complete"
+    _ -> fail "Expected V2 allocation factory to create a pending instruction"
+
+-- | Committed allocations cannot be withdrawn before their settlement deadline.
+test_v2CommittedAllocationWithdrawAfterDeadline : Script ()
+test_v2CommittedAllocationWithdrawAfterDeadline = do
+  TestEnv{..} <- setupTestEnv
+  let alice = parties.alice
+      bob = parties.bob
+      executor = parties.executor
+  [h1] <- fundParty registry alice 100.0
+  instrCid <- createPendingV2AllocationInstruction registry alice bob executor 100.0 [h1] True
+  acceptResult <- acceptV2AllocationInstruction alice instrCid
+  case acceptResult.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed allocCid -> do
+      submitMustFail alice $
+        exerciseCmd allocCid AllocationV2.Allocation_Withdraw with
+          actors = [alice]
+          extraArgs = emptyExtraArgs
+      setTime (time (date 2025 Jan 1) 0 0 0)
+      withdrawResult <- submit alice $
+        exerciseCmd allocCid AllocationV2.Allocation_Withdraw with
+          actors = [alice]
+          extraArgs = emptyExtraArgs
+      case withdrawResult.output of
+        AllocationV2.AllocationResult_Withdrawn -> pure ()
+        _ -> fail "Expected committed V2 allocation withdraw after deadline"
+      assertNoLockedHoldings alice registry.instrumentId
+      checkBalance alice registry.instrumentId 100.0
+    _ -> fail "Expected V2 allocation instruction accept to complete"

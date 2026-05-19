@@ -1,0 +1,271 @@
+-- | Experimental live CIP-0112 settlement probes for CDP close and liquidation.
+-- These scripts exercise the ported local V2 Allocation/SettlementFactory
+-- dependency. They are non-release discovery tests, not conformance tests.
+module Stablecoin.Test.Cip112LiveSettlement where
+
+import DA.Optional (fromSome, isNone)
+import DA.Text qualified as Text
+import DA.TextMap qualified as TextMap
+import DA.Time
+
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1
+import Splice.Api.Token.HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import SimpleToken.Holding (SimpleHolding(..), LockedSimpleHolding(..))
+import SimpleToken.Rules (SimpleTokenRules(..), v2SettlementFactoryBasicAccountFailureMsg)
+
+import Stablecoin.Oracle
+import Stablecoin.Test.Cdp
+import Stablecoin.Vault
+
+createCip112Rules
+  : CdpTestEnv
+  -> Script (ContractId SimpleTokenRules, Disclosure)
+createCip112Rules env = do
+  rulesCid <- submit env.admin $ createCmd SimpleTokenRules with
+    admin = env.admin
+    supportedInstruments = [env.collateralInstrumentId.id, env.stablecoinInstrumentId.id]
+  disc <- fromSome <$> queryDisclosure @SimpleTokenRules env.admin rulesCid
+  pure (rulesCid, disc)
+
+cip112Config : ContractId SimpleTokenRules -> Party -> Text -> Optional Time -> Cip112SettlementConfig
+cip112Config rulesCid executor settlementRefId settlementDeadline =
+  Cip112SettlementConfig with
+    allocationFactoryCid = toInterfaceContractId @AllocationInstructionV2.AllocationFactory rulesCid
+    settlementFactoryCid = toInterfaceContractId @AllocationV2.SettlementFactory rulesCid
+    executor
+    settlementRefId
+    settlementDeadline
+
+submitWithRuleDisclosure2 : Party -> Party -> Disclosure -> Commands a -> Script a
+submitWithRuleDisclosure2 p1 p2 _disc cmds =
+  submitMulti [p1, p2] [] cmds
+
+submitWithRuleDisclosure3 : Party -> Party -> Party -> Disclosure -> Commands a -> Script a
+submitWithRuleDisclosure3 p1 p2 p3 _disc cmds =
+  submitMulti [p1, p2, p3] [] cmds
+
+submitWithRuleDisclosureError : Party -> Disclosure -> Commands a -> Script SubmitError
+submitWithRuleDisclosureError p disc cmds =
+  submitWithError (actAs p <> discloseMany [disc]) cmds
+
+submitWithRuleDisclosureError2 : Party -> Party -> Disclosure -> Commands a -> Script SubmitError
+submitWithRuleDisclosureError2 p1 p2 disc cmds =
+  submitWithError (actAs p1 <> actAs p2 <> discloseMany [disc]) cmds
+
+assertSubmitErrorContains : Text -> SubmitError -> Script ()
+assertSubmitErrorContains expected err =
+  assertMsg
+    ("Expected submit error to contain " <> show expected <> ", got: " <> show err)
+    (expected `Text.isInfixOf` show err)
+
+simpleBalance : Party -> Party -> InstrumentId -> Script Decimal
+simpleBalance observer owner instrumentId = do
+  holdings <- query @SimpleHolding observer
+  pure $ sum
+    [ holding.amount
+    | (_, holding) <- holdings
+    , holding.owner == owner
+    , holding.instrumentId == instrumentId
+    ]
+
+assertSimpleBalance : Party -> Party -> InstrumentId -> Decimal -> Script ()
+assertSimpleBalance observer owner instrumentId expected = do
+  actual <- simpleBalance observer owner instrumentId
+  assertMsg
+    ("Expected balance " <> show expected <> " but saw " <> show actual)
+    (actual == expected)
+
+assertSettledCount : Int -> AllocationV2.SettlementFactory_SettleBatchResult -> Script ()
+assertSettledCount expected result =
+  assertMsg
+    ("Expected " <> show expected <> " allocation settle results")
+    (length result.allocationSettleResults == expected)
+
+assertChangeMapHasOne : Text -> TextMap.TextMap [ContractId HoldingV2.Holding] -> Script ()
+assertChangeMapHasOne instrumentId changeMap =
+  case TextMap.lookup instrumentId changeMap of
+    Some [_cid] -> pure ()
+    Some cids -> fail $ "Expected one change CID for " <> instrumentId <> ", found " <> show (length cids)
+    None -> fail $ "Expected change CID for " <> instrumentId
+
+test_cip112CloseWithLiveSettlementReturnsCollateralAndChange : Script ()
+test_cip112CloseWithLiveSettlementReturnsCollateralAndChange = do
+  env <- setupCdpTestEnv
+  (rulesCid, rulesDisc) <- createCip112Rules env
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, mintedStablecoinCid) <- submit env.alice $
+    exerciseCmd vaultCid Vault_MintStablecoin with
+      mintAmount = 5000.0
+      oracleCid = env.oracleCid
+  extraRepaymentCid <- fundStablecoin env env.alice 1000.0
+
+  result <- submitWithRuleDisclosure2 env.admin env.alice rulesDisc $
+    exerciseCmd vaultCid2 Vault_Cip112CloseWithSettlement with
+      settlementConfig = cip112Config rulesCid env.admin "oz.cdp/test/close" (Some (addRelTime demoTime (hours 1)))
+      stablecoinHoldingCids =
+        [ toInterfaceContractId @Holding mintedStablecoinCid
+        , extraRepaymentCid
+        ]
+
+  assertSettledCount 2 result.settlementResult
+  assertChangeMapHasOne env.stablecoinInstrumentId.id result.repaymentChangeCids
+  collateral <- fetchHolding env.alice result.collateralCid
+  assertMsg "close returns all collateral"
+    (collateral.amount == 10.0 && collateral.instrumentId == env.collateralInstrumentId)
+  assertSimpleBalance env.alice env.alice env.stablecoinInstrumentId 1000.0
+  assertSimpleBalance env.admin env.admin env.stablecoinInstrumentId 0.0
+  closedVault <- queryContractId env.alice vaultCid2
+  assertMsg "live close consumes the vault" (isNone closedVault)
+  submitMustFail env.alice $ exerciseCmd vaultCid2 Vault_WithdrawCollateral with
+    withdrawAmount = 1.0
+    oracleCid = env.oracleCid
+
+test_cip112LiquidationWithLiveSettlementSeizesCollateralAndReturnsChange : Script ()
+test_cip112LiquidationWithLiveSettlementSeizesCollateralAndReturnsChange = do
+  env <- setupCdpTestEnv
+  (rulesCid, rulesDisc) <- createCip112Rules env
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $
+    exerciseCmd vaultCid Vault_MintStablecoin with
+      mintAmount = 12000.0
+      oracleCid = env.oracleCid
+  newOracleCid <- submit env.admin $ exerciseCmd env.oracleCid PriceOracle_UpdatePrice with
+    newPrice = 1500.0
+  bobStablecoin <- fundStablecoin env env.bob 13000.0
+
+  result <- submitWithRuleDisclosure3 env.admin env.alice env.bob rulesDisc $
+    exerciseCmd vaultCid2 Vault_Cip112LiquidateWithSettlement with
+      liquidator = env.bob
+      stablecoinHoldingCids = [bobStablecoin]
+      oracleCid = newOracleCid
+      settlementConfig = cip112Config rulesCid env.admin "oz.cdp/test/liquidation" (Some (addRelTime demoTime (hours 1)))
+
+  assertSettledCount 4 result.settlementResult
+  assertChangeMapHasOne env.stablecoinInstrumentId.id result.liquidatorStablecoinChangeCids
+  assertMsg "no bad debt in partial-seizure liquidation" (result.badDebt == 0.0)
+  assertSimpleBalance env.bob env.bob env.collateralInstrumentId 9.04
+  assertSimpleBalance env.bob env.bob env.stablecoinInstrumentId 1000.0
+  assertSimpleBalance env.admin env.admin env.stablecoinInstrumentId 0.0
+  case result.ownerCollateralCid of
+    Some cid -> do
+      ownerRemainder <- fetchHolding env.alice cid
+      assertMsg "owner remainder should be 0.96 collateral"
+        (ownerRemainder.amount == 0.96 && ownerRemainder.instrumentId == env.collateralInstrumentId)
+    None -> fail "expected owner collateral remainder"
+
+test_cip112LiquidationWithLiveSettlementRecordsBadDebt : Script ()
+test_cip112LiquidationWithLiveSettlementRecordsBadDebt = do
+  env <- setupCdpTestEnv
+  (rulesCid, rulesDisc) <- createCip112Rules env
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $
+    exerciseCmd vaultCid Vault_MintStablecoin with
+      mintAmount = 12000.0
+      oracleCid = env.oracleCid
+  newOracleCid <- submit env.admin $ exerciseCmd env.oracleCid PriceOracle_UpdatePrice with
+    newPrice = 500.0
+  bobStablecoin <- fundStablecoin env env.bob 8000.0
+
+  result <- submitWithRuleDisclosure3 env.admin env.alice env.bob rulesDisc $
+    exerciseCmd vaultCid2 Vault_Cip112LiquidateWithSettlement with
+      liquidator = env.bob
+      stablecoinHoldingCids = [bobStablecoin]
+      oracleCid = newOracleCid
+      settlementConfig = cip112Config rulesCid env.admin "oz.cdp/test/liquidation-bad-debt" (Some (addRelTime demoTime (hours 1)))
+
+  assertSettledCount 4 result.settlementResult
+  assertMsg "full seizure should leave no owner collateral output"
+    (result.ownerCollateralCid == None)
+  assertMsg "bad debt should match uncovered debt"
+    (result.badDebt == 4000.0)
+  assertSimpleBalance env.bob env.bob env.collateralInstrumentId 10.0
+  assertSimpleBalance env.admin env.admin env.stablecoinInstrumentId 0.0
+
+test_cip112CloseUnderpaymentRollsBackVault : Script ()
+test_cip112CloseUnderpaymentRollsBackVault = do
+  env <- setupCdpTestEnv
+  (rulesCid, rulesDisc) <- createCip112Rules env
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $
+    exerciseCmd vaultCid Vault_MintStablecoin with
+      mintAmount = 5000.0
+      oracleCid = env.oracleCid
+  shortRepaymentCid <- fundStablecoin env env.alice 4000.0
+
+  _err <- submitWithRuleDisclosureError2 env.admin env.alice rulesDisc $
+    exerciseCmd vaultCid2 Vault_Cip112CloseWithSettlement with
+      settlementConfig = cip112Config rulesCid env.admin "oz.cdp/test/close-underpay" (Some (addRelTime demoTime (hours 1)))
+      stablecoinHoldingCids = [shortRepaymentCid]
+  vaultAfterFailure <- fetchVault env.alice vaultCid2
+  assertMsg "underpayment must leave the CDP state active"
+    (vaultAfterFailure.debtAmount == 5000.0)
+
+test_cip112LiveSettlementRejectsCollateralLockedRepayment : Script ()
+test_cip112LiveSettlementRejectsCollateralLockedRepayment = do
+  env <- setupCdpTestEnv
+  (rulesCid, rulesDisc) <- createCip112Rules env
+  vaultCid <- openVault env env.alice 10.0
+  (vaultCid2, _) <- submit env.alice $
+    exerciseCmd vaultCid Vault_MintStablecoin with
+      mintAmount = 5000.0
+      oracleCid = env.oracleCid
+  lockedCid <- submitMulti [env.admin, env.alice] [] $ createCmd LockedSimpleHolding with
+    admin = env.admin
+    owner = env.alice
+    instrumentId = env.stablecoinInstrumentId
+    amount = 5000.0
+    lock = Lock with
+      holders = [env.admin]
+      expiresAt = Some (addRelTime demoTime (hours 1))
+      expiresAfter = None
+      context = Some "cip112-live-settlement-lock-contention"
+    extraObservers = []
+    meta = emptyMetadata
+
+  _err <- submitWithRuleDisclosureError2 env.admin env.alice rulesDisc $
+    exerciseCmd vaultCid2 Vault_Cip112CloseWithSettlement with
+      settlementConfig = cip112Config rulesCid env.admin "oz.cdp/test/locked-repay" (Some (addRelTime demoTime (hours 1)))
+      stablecoinHoldingCids = [toInterfaceContractId @Holding lockedCid]
+  vaultAfterFailure <- fetchVault env.alice vaultCid2
+  assertMsg "locked repayment contention must not consume the vault"
+    (vaultAfterFailure.debtAmount == 5000.0)
+
+test_cip112ProviderManagedSettlementLegRejectedAndMetadataNamed : Script ()
+test_cip112ProviderManagedSettlementLegRejectedAndMetadataNamed = do
+  env <- setupCdpTestEnv
+  (rulesCid, rulesDisc) <- createCip112Rules env
+  let settlement = AllocationV2.SettlementInfo with
+        executors = [env.admin]
+        settlementRef = AllocationV2.Reference with id = "oz.cdp/test/provider"; cid = None
+        settlementDeadline = Some (addRelTime demoTime (hours 1))
+        meta = cip112FlowMeta "provider-negative"
+      providerAccount = HoldingV2.Account with
+        owner = Some env.alice
+        provider = Some env.admin
+        id = "oz.cdp/provider-managed"
+      transferLeg = cip112TransferLeg
+        "oz.cdp/provider-negative"
+        providerAccount
+        (TokenStandard.basicAccount env.bob)
+        env.stablecoinInstrumentId
+        1.0
+        "provider-negative"
+      sfCid = toInterfaceContractId @AllocationV2.SettlementFactory rulesCid
+
+  assertMsg "metadata should record the experimental flow"
+    (TextMap.lookup "oz.cdp/cip112-flow" transferLeg.meta.values == Some "provider-negative")
+  err <- submitWithRuleDisclosureError env.admin rulesDisc $
+    exerciseCmd sfCid AllocationV2.SettlementFactory_SettleBatch with
+      settlement
+      transferLegs = [transferLeg]
+      allocations = []
+      actors = [env.admin]
+      extraArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+  assertSubmitErrorContains v2SettlementFactoryBasicAccountFailureMsg err
