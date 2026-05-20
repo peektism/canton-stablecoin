@@ -1,18 +1,19 @@
 # CIP-0112 Extension Plan: canton-stablecoin
 
 Date: 2026-05-19
-Status: Discovery / experimental implementation; narrow Daml source changes
-are allowed when clearly marked non-release
+Status: Discovery / experimental implementation; current CDP V2 work remains
+non-release and non-conformant. Provider-managed CDP authority is a separate
+follow-up that requires explicit CDP rationale before implementation.
 Owner: OpenZeppelin technical lead
 Reviewer: Digital Asset technical contact, CIP-0112 authors, OpenZeppelin
 security lead (for CDP authorization model implications)
 
 ## Scope
 
-This is the per-tool extension plan for adding CIP-0112 (Token Standard V2)
-V2 interfaces to the MakerDAO-style CDP stablecoin in
-`tools/canton-stablecoin/stablecoin/`, on top of the underlying
-CIP-0056 token registry reused from `simple-token/`.
+This is the per-tool extension plan for experimental CIP-0112 (Token Standard
+V2) probes in the MakerDAO-style CDP stablecoin in
+`tools/canton-stablecoin/stablecoin/`, on top of the underlying CIP-0056 token
+registry reused from `simple-token/`.
 
 Parents:
 
@@ -20,12 +21,14 @@ Parents:
 - Sibling per-tool plan:
   `/Users/x/canton/tools/canton-token-template/docs/CIP-0112-EXTENSION-PLAN.md`
 
-This plan is **discovery plus experimental implementation**. Daml source in
-`stablecoin/` or `stablecoin-test/` may be modified in small, reversible
-prototype slices when the local change can either compile against the current
-simple-token base or record the exact missing token-template dependency it
-needs. Prototype code must not be presented as CIP-0112-conformant library or
-RI code.
+The current CDP prototype covers live close and liquidation
+`SettlementFactory_SettleBatch` under conservative basic-account assumptions.
+Vault-keeper provider authority modelling, allocation-request driven CDP
+repayment and liquidation, iterated settlement, receipt/reporting, cross-admin
+handling, production-shaped disclosure, and LocalNet/client smoke remain
+CDP-specific follow-up slices. They are not conformance claims and should not
+be bundled into token-template provider-managed account work without separate
+CDP rationale.
 
 ## Why the stablecoin is special
 
@@ -134,7 +137,7 @@ prototype:
 | Stale state | V1 stale-vault probes still prove consumed vault CIDs cannot be re-exercised. Live close and negative-path tests also confirm failed V2 settlement preparation leaves the CDP state active. Direct stale V2 allocation-CID replay/cancel/withdraw tests remain delegated to the local simple-token V2 tests. |
 | Upgrade | The six preview V2 DARs and the copied simple-token V2 source are experimental inputs from the token-template prototype. Any source-of-record, package-name, field-shape, or utility-default churn requires re-baselining this module before release work. |
 | Blockers | Allocation requests, iterated settlement, provider-managed account authority, wallet/off-ledger metadata publication, receipt/reporting standards, cross-admin settlement, and public package pins are not implemented. |
-| Non-conformance | The module is not a CIP-0112 implementation and is not a conformance test. It is a local compile/test proof that the CDP can exercise live V2 allocation and batch settlement under conservative basic-account assumptions. |
+| Non-conformance status | The module is not a CIP-0112 implementation and is not a conformance test. It is a local compile/test proof that the CDP can exercise live V2 allocation and batch settlement under conservative basic-account assumptions. Provider-managed authority, allocation requests, iterated settlement, receipt/reporting, and cross-admin coordination remain CDP-specific follow-up candidates, not active conformance evidence. |
 
 ## Verification Closeout
 
@@ -293,8 +296,10 @@ into `repos/oz-canton-ri-lending/` (the future MIT-licensed lending RI).
 
 ## Non-goals
 
-- No promotion of prototype Daml into a released RI or `repos/oz-daml-contracts/`.
-- No release packaging; the V2 DAR source-of-record is unresolved.
+- No public API hardening in `repos/oz-daml-contracts/` or
+  `repos/oz-canton-ri-lending/` ahead of the workspace slice 18 RI-backed
+  extraction sequence and the M1-PF-004 license-boundary gate.
+- No new SDK pins unless an active slice proves the exact need;
+  observations feed back into M1-PF-001 rather than landing a pin here.
+- No hosted CI; local manual workflow remains the evidence path.
 - No claim of CIP-0112 conformance for the CDP layer.
-- No new SDK pins unless the prototype proves the exact need and an ADR records
-  it.
